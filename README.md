@@ -37,6 +37,23 @@ Then install Standby from the store. The app's Docker image is built for arm64 a
 
 After installing, open the app and add your first transaction: sign it in your own wallet, paste the raw signed hex, and arm it. Set the check-in interval in Settings, then check in — from the app, or by creating a check-in API key for your gadget, shortcut, bot, or script.
 
+## Run on any Linux box (Docker)
+
+No Umbrel needed. On any Linux machine with Docker and the Compose plugin (amd64 or arm64 — the image is multi-arch):
+
+```sh
+mkdir standby && cd standby
+curl -O https://raw.githubusercontent.com/thefuckisalommy/Standby-on-Umbrel/main/docker-compose.yml
+docker compose up -d
+# open http://localhost:3100
+```
+
+The web UI listens on localhost only by default (`127.0.0.1:3100`) — there is no login screen on this path, so it is not exposed to your network. Reach it on the box itself, over SSH (`ssh -L 3100:localhost:3100 <box>`), over Tailscale, or behind your own reverse proxy with auth. To open it to your LAN instead, change the web port line to `"${STANDBY_WEB_PORT:-3100}:3100"` — only on a network you trust.
+
+The check-in receiver listens on port 3101 for API-key check-ins, same as on Umbrel: `curl -X POST http://<box>:3101/checkin -H "Authorization: Bearer <your key>"`. It is plain HTTP, protected only by the key — keep it on your trusted LAN or Tailscale network, as in [SECURITY.md](SECURITY.md).
+
+Data lives in `./data` and `./checkin` next to the compose file, as plain files. Back up by copying those two directories, or use the in-app Backup download; restore with the in-app Restore. Everything else — signing, arming, check-ins, releases — works exactly as on Umbrel.
+
 ## Run locally
 
 ```sh
@@ -67,4 +84,4 @@ The app broadcasts via a primary mempool node with a secondary as fallback (memp
 
 ## Security
 
-Security notes live in [SECURITY.md](SECURITY.md) — read it before arming a transaction. The short version: Standby's web UI and API are protected only by Umbrel's app login (do not disable it), your signed transactions are stored unencrypted and are bearer, and the check-in receiver on port 3101 is plain HTTP, so keep it on your trusted LAN and Tailscale network only.
+Security notes live in [SECURITY.md](SECURITY.md) — read it before arming a transaction. The short version: Standby's web UI and API are protected only by Umbrel's app login (do not disable it), your signed transactions are stored unencrypted and are bearer, and the check-in receiver on port 3101 is plain HTTP, so keep it on your trusted LAN and Tailscale network only. On the generic Docker path there is no login at all — the web UI listens on localhost only by default; see "Run on any Linux box" before exposing it.

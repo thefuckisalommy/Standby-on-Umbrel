@@ -1,0 +1,46 @@
+# Standby — generic Linux docker-compose
+# Run Standby on any Linux box with Docker, without Umbrel.
+#   docker compose up -d
+# The web UI listens on 127.0.0.1:3100 by default (localhost only — there is
+# no login screen, so do not expose it to a network you do not trust; reach
+# it over SSH, Tailscale, or your own reverse proxy). The check-in receiver
+# listens on 3101 for API-key check-ins from your bot or gadget.
+# Data lives in ./data and ./checkin next to this file — plain files, so a
+# backup is just a copy of those two directories (or the in-app Backup
+# download). See README.md ("Run on any Linux box") and SECURITY.md.
+
+services:
+  web:
+    image: ghcr.io/thefuckisalommy/standby:latest
+    restart: on-failure
+    stop_grace_period: 1m30s
+    environment:
+      PORT: 3100
+      DATA_DIR: /data
+      CHECKIN_DIR: /checkin
+    volumes:
+      - ./data:/data
+      - ./checkin:/checkin
+    ports:
+      - "127.0.0.1:${STANDBY_WEB_PORT:-3100}:3100"
+
+  # Check-in receiver: the check-in-only front door. It runs the same image
+  # with a different command and mounts ONLY the shared /checkin directory:
+  # the key hashes the app publishes (keys.json) and the check-in timestamps
+  # it writes (last.json). It never mounts /data, so it cannot see the
+  # transactions — even from inside its own container. A key presented here
+  # can only record a check-in; it cannot read, broadcast, or change
+  # anything. Plain HTTP, protected only by the check-in key — keep it on
+  # a trusted LAN or Tailscale network.
+  checkin:
+    image: ghcr.io/thefuckisalommy/standby:latest
+    command: ["node", "checkin-receiver/server.js"]
+    restart: on-failure
+    stop_grace_period: 1m
+    environment:
+      PORT: 3101
+      CHECKIN_DIR: /checkin
+    volumes:
+      - ./checkin:/checkin
+    ports:
+      - "${STANDBY_CHECKIN_PORT:-3101}:3101"
