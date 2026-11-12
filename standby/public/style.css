@@ -1,0 +1,270 @@
+/* Standby — dark theme. System fonts, soft borders, one accent. */
+:root {
+  --bg: #0f1115;
+  --card: #1a1d24;
+  --ink: #f3f4f6;
+  --muted: #9ca3af;
+  --line: #2f3540;
+  --accent: #d97706; /* warm amber, restrained */
+  --accent-bg: #3f2a08;
+  --ok: #4ade80;
+  --ok-bg: #14532d;
+  --warn: #fbbf24;
+  --warn-bg: #451a03;
+  --bad: #f87171;
+  --bad-bg: #450a0a;
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+header.appbar {
+  position: sticky; top: 0; z-index: 50;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.appbar-title { font-size: 22px; font-weight: 700; letter-spacing: 0.2px; }
+.appbar-logo { height: 28px; width: 28px; flex-shrink: 0; border-radius: 6px; display: block; }
+header .spacer { flex: 1; }
+/* Burger menu (three-line ☰). */
+.burger { position: relative; }
+.burger summary {
+  list-style: none; cursor: pointer;
+  padding: 8px; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; color: var(--ink);
+}
+.burger summary::-webkit-details-marker { display: none; }
+.burger summary:hover { background: #2f3540; }
+.burger nav {
+  position: absolute; right: 0; top: calc(100% + 8px); min-width: 12rem;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.burger nav a {
+  display: block; padding: 12px 16px; color: var(--ink);
+  text-decoration: none; font-size: 15px;
+}
+.burger nav a:hover { background: #2f3540; }
+main { max-width: 880px; margin: 0 auto; padding: 20px; }
+nav.tabs {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+nav.tabs button {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  padding: 10px 14px; font-size: 15px; color: var(--muted); cursor: pointer;
+}
+nav.tabs button.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+section.tab { display: none; }
+section.tab.active { display: block; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.card h2 { margin: 0 0 6px; font-size: 18px; }
+.card h3 { margin: 16px 0 6px; font-size: 15px; }
+.card p { margin: 6px 0; }
+.muted { color: var(--muted); font-size: 14px; }
+label { display: block; font-size: 14px; font-weight: 600; margin: 12px 0 4px; }
+input[type="text"], input[type="email"], input[type="number"], input[type="date"],
+input[type="password"], textarea, select {
+  width: 100%; padding: 9px 10px; font: inherit; font-size: 15px;
+  border: 1px solid var(--line); border-radius: 6px; background: #0f1115; color: var(--ink);
+}
+textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px; }
+textarea.plain { font-family: inherit; }
+input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.row > * { flex: 1 1 160px; }
+/* Input + inline unit, e.g. Broadcast Threshold [ 90 ] days. */
+.inline-unit { display: flex; align-items: center; gap: 8px; }
+.inline-unit input { flex: 1; }
+.inline-unit span { color: var(--muted); white-space: nowrap; }
+button {
+  font: inherit; font-size: 15px; cursor: pointer;
+  padding: 9px 16px; border-radius: 6px;
+  border: 1px solid var(--line); background: #262b35; color: var(--ink);
+}
+button:hover { background: #2f3540; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: #b45309; }
+button.big { font-size: 18px; padding: 14px 28px; }
+button.danger { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: default; }
+.pill {
+  display: inline-block; padding: 3px 10px; border-radius: 999px;
+  font-size: 13px; font-weight: 600;
+}
+.pill.ok { background: var(--ok-bg); color: var(--ok); }
+.pill.warn { background: var(--warn-bg); color: var(--warn); }
+.pill.bad { background: var(--bad-bg); color: var(--bad); }
+.pill.muted { background: #2f3540; color: var(--muted); }
+.stub {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  background: var(--warn-bg); color: var(--warn); border: 1px dashed var(--accent);
+  font-size: 12px; font-weight: 700; letter-spacing: 0.4px;
+}
+.notice {
+  border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  background: #1c1a17; border-radius: 6px; padding: 10px 14px; margin: 12px 0;
+  font-size: 14px;
+}
+.notice.bad { border-left-color: var(--bad); background: #2a1215; }
+table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+pre {
+  background: #0f1115; border: 1px solid var(--line); border-radius: 6px;
+  padding: 12px; white-space: pre-wrap; word-break: break-word;
+  font-size: 13px; max-height: 300px; overflow: auto;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.checklist label { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; margin: 10px 0; cursor: pointer; }
+.checklist input[type="checkbox"] { width: 18px; height: 18px; margin-top: 2px; flex-shrink: 0; }
+.checklist .done { color: var(--muted); text-decoration: line-through; }
+.progress { height: 8px; background: #2f3540; border-radius: 999px; overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; background: var(--accent); }
+.kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-size: 15px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+/* Narrow screens (phones): the check-in rows stack — label above the
+   value — so the date ("11/11/2026, 9:00 AM (0 days)", ~205px at 15px)
+   fits on one line. In the two-column grid it cannot: the label needs
+   ~120px and a phone only has 280–332px of content width, so no
+   label-column narrowing fits both. Scoped to the Dashboard card only;
+   the modal's .kv keeps its own 110px columns. */
+@media (max-width: 560px) {
+  #tab-dashboard .kv { grid-template-columns: 1fr; }
+  #tab-dashboard .kv dd { white-space: nowrap; }
+  #tab-dashboard .kv dd + dt { margin-top: 8px; }
+}
+.readiness-item { margin: 12px 0; }
+.readiness-label { color: var(--muted); font-size: 13px; margin-bottom: 2px; }
+.node-lines > div + div { margin-top: 4px; }
+details.notice summary { cursor: pointer; font-weight: 600; }
+details.notice p { margin: 8px 0 0; }
+a { color: #f59e0b; }
+
+/* Card header row: heading left, toggle right. */
+.section-head { display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; }
+.card .section-head h2 { margin: 0; }
+
+/* Toggle switch (checkbox styled as a switch). */
+.switch { display: inline-flex; align-items: center; gap: 10px; cursor: pointer;
+  font-weight: 600; font-size: 15px; margin: 0; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .slider { width: 44px; height: 24px; border-radius: 999px; background: #374151;
+  transition: background 0.15s; flex-shrink: 0; position: relative; }
+.switch .slider::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px;
+  height: 18px; border-radius: 50%; background: #f3f4f6; transition: transform 0.15s; }
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::after { transform: translateX(20px); }
+.switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Scrollable table (recent check-ins): room for ~10 rows, scroll for more. */
+.scroll-table { max-height: 400px; overflow-y: auto; }
+.scroll-table thead th { position: sticky; top: 0; background: var(--card); }
+/* A collapsed message card shows only its header row + toggle. */
+.card.collapsed > :not(.section-head) { display: none; }
+/* The transaction card head: one row, never wrapping — the label
+   takes the space that is left and wraps inside it, the TXID is a
+   fixed width, and the status pill is pinned to the top-right, always
+   in the same spot, no matter how long the label is, and the label
+   can never run over it. (It used to wrap, which could drop the pill
+   below the TXID on a settled card.) The arm/disarm toggle is always
+   its own row below the label. Settled transactions (broadcast or
+   stale) hide their body into a collapsible, collapsed by default. */
+/* The Archived Transactions card is a <details>, collapsed by default,
+   so it takes little space until the owner opens it. The summary reads
+   like the other cards' headings. */
+details.archived summary { cursor: pointer; font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+
+/* A transaction card nested inside its parent card — the active ones
+   live in the Pre-signed Bitcoin transactions card, the settled ones
+   in the Archived Transactions card. A lighter panel, not a full
+   card. */
+.tx-card.tx-sub { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #14171d; }
+.tx-card .tx-head { display: flex; align-items: flex-start; gap: 12px; flex-wrap: nowrap; }
+.tx-card .tx-head b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; }
+.tx-card .tx-head .txid { flex-shrink: 0; color: var(--muted); font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tx-card .tx-head .pill { flex-shrink: 0; margin-left: auto; }
+
+/* A check-in API key row: label left, dates muted, Revoke right. */
+.api-key-row { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  padding: 10px 0; border-bottom: 1px solid var(--line); }
+.api-key-row:last-child { border-bottom: none; }
+.api-key-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; }
+.api-key-row button { padding: 6px 12px; font-size: 14px; }
+/* Buttons that belong on one line (the data backup card). */
+p.inline-btns { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center; }
+
+/* The status pop-out (broadcast all) lists one line per transaction. */
+.modal ul.plain-list { margin: 8px 0; padding-left: 18px; }
+.modal ul.plain-list li { margin: 4px 0; overflow-wrap: anywhere; }
+.tx-card .tx-arm { margin-top: 12px; }
+.tx-card .tx-details { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
+.tx-card .tx-details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+.tx-card .tx-notes { color: var(--muted); font-size: 14px; margin: 4px 0; }
+.tx-card .tx-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.tx-card .tx-actions button { padding: 6px 12px; font-size: 14px; }
+/* A sent transaction: green line (when + node + confirmations). A shared
+   input: amber warning line in each affected card. These lines wrap
+   instead of overflowing the card. */
+.tx-card .tx-sent { color: var(--ok); font-size: 14px; margin: 4px 0; overflow-wrap: anywhere; }
+.tx-card .tx-warn { color: var(--warn); font-size: 14px; margin: 4px 0; overflow-wrap: anywhere; }
+.tx-card .tx-dryrun { overflow-wrap: anywhere; }
+/* A broadcast log row is clickable — it pops out the details of that
+   entry. */
+.log-row { cursor: pointer; }
+.log-row:hover { background: #232833; }
+/* Confirmation dialog for the manual broadcasts. */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, 0.6);
+  display: none; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  position: relative;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 20px;
+  max-width: 480px; width: 100%;
+  max-height: 90vh; overflow-y: auto;
+}
+/* The X in the modal's top-right corner closes it — every modal
+   use (confirmation, details pop-out, new-key pop-out) closes the
+   same way: X, the Cancel/Close button, or clicking the backdrop. */
+.modal-x {
+  position: absolute; top: 6px; right: 10px;
+  background: transparent; border: none;
+  color: var(--muted); font-size: 24px; line-height: 1;
+  padding: 4px 8px; cursor: pointer;
+}
+.modal-x:hover { color: var(--fg); }
+/* The new key, shown in its pop-out: full width, monospace, so the
+   whole 43-char key is readable at a glance. */
+#new-key-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px;
+  width: 100%; box-sizing: border-box; margin: 8px 0;
+}
+.modal #btn-key-copy { margin-top: 4px; }
+.modal h3 { margin: 0 0 8px; font-size: 17px; }
+.modal p { margin: 8px 0; }
+.modal .kv { grid-template-columns: 110px 1fr; }
+.modal .kv dd { overflow-wrap: anywhere; }
+.modal pre { max-height: 240px; }

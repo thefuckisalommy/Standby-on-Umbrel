@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Standby — presigned Bitcoin transactions</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="appbar">
+  <img class="appbar-logo" src="/logo.jpg" alt="Standby logo">
+  <span class="appbar-title">Standby</span>
+  <span class="spacer"></span>
+  <details class="burger" id="burger-menu">
+    <summary title="Menu" aria-label="Menu">&#9776;</summary>
+    <nav>
+      <a href="#dashboard" data-tab-link="dashboard">Dashboard</a>
+      <a href="#transactions" data-tab-link="bitcoin">Transaction(s)</a>
+      <a href="#settings" data-tab-link="settings">Settings</a>
+      <a href="#logs" data-tab-link="logs">Logs</a>
+      <a href="#" id="exit-app">Exit App</a>
+    </nav>
+  </details>
+</header>
+
+<main>
+  <nav class="tabs" id="tabs">
+    <button data-tab="dashboard" class="active">Dashboard</button>
+    <button data-tab="bitcoin">Transaction(s)</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+
+  <!-- ============ DASHBOARD ============ -->
+  <section class="tab active" id="tab-dashboard">
+    <div class="card">
+      <div class="section-head">
+        <h2>Check-in status</h2>
+        <span id="status-pill" class="pill muted">—</span>
+      </div>
+      <p id="status-line" class="muted">Loading…</p>
+      <dl class="kv" style="margin-top:12px">
+        <dt>Last check-in</dt><dd id="last-checkin">—</dd>
+        <dt>Next check-in due</dt><dd id="next-due">—</dd>
+      </dl>
+      <p style="margin-top:16px">
+        <button id="btn-checkin" class="primary big">✓ Check in — I'm here</button>
+      </p>
+      <p id="checkin-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Release readiness</h2>
+      <div class="readiness-item">
+        <div class="readiness-label">Transaction</div>
+        <div id="readiness-btc">—</div>
+      </div>
+      <div class="readiness-item">
+        <div class="readiness-label">Node Status</div>
+        <div class="node-lines">
+          <div><span id="readiness-primary">—</span> <span id="readiness-primary-status" class="pill muted">Not tested</span></div>
+          <div><span id="readiness-secondary">—</span> <span id="readiness-secondary-status" class="pill muted">Not tested</span></div>
+        </div>
+      </div>
+      <p id="readiness-checked" class="muted"></p>
+    </div>
+  </section>
+
+  <!-- ============ LOGS ============ -->
+  <section class="tab" id="tab-logs">
+    <div class="card">
+      <h2>Broadcast log</h2>
+      <p class="muted">Every dry-run, broadcast, and release attempt is recorded here. Tap a row for the full details of that entry, including the signed transaction hex.</p>
+      <div class="scroll-table">
+      <table><thead><tr><th>When</th><th>Kind</th><th>TXID</th><th>Status</th></tr></thead>
+      <tbody id="broadcast-log"><tr><td colspan="4" class="muted">Nothing logged yet.</td></tr></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Recent check-ins</h2>
+      <div class="scroll-table">
+      <table><thead><tr><th>When</th><th>Method</th><th>From</th></tr></thead>
+      <tbody id="recent-checkins"><tr><td colspan="3" class="muted">None yet.</td></tr></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ BITCOIN ============ -->
+  <section class="tab" id="tab-bitcoin">
+    <div class="card">
+      <div class="section-head">
+        <h2>Pre-signed Bitcoin transactions</h2>
+      </div>
+      <p class="muted">Standby stores your presigned Bitcoin transactions, ready when they're needed — a convenient place to keep them, or a dead man's switch: if you stop checking in past the broadcast threshold, it broadcasts the ones you armed below. Sign each one in your own wallet and paste the raw signed hex here.</p>
+      <details class="notice">
+        <summary>These broadcasts are real</summary>
+        <p>The dry-run buttons only check whether the inputs are still unspent — they never broadcast. The release itself broadcasts for real, so keep the inputs unspent (spend them and the transaction goes stale), use RBF so the heir can fee-bump, and remember a false-positive release moves real funds. If this device is down, nothing broadcasts.</p>
+      </details>
+      <p>
+        <button id="btn-btc-test-all">Dry-run all</button>
+        <button id="btn-btc-broadcast-all" class="danger">Broadcast all</button>
+      </p>
+      <p id="btc-all-msg" class="muted"></p>
+      <div id="btc-active-list"></div>
+    </div>
+    <details class="card archived" id="archived-card">
+      <summary>Archived Transactions</summary>
+      <p class="muted">Transactions that have already been broadcast, or whose inputs were declared spent.</p>
+      <div id="btc-archived-list"></div>
+    </details>
+    <div class="card">
+      <h3 id="btc-form-title">Add a transaction</h3>
+      <label for="btc-label">Label (optional)</label>
+      <input id="btc-label" type="text" placeholder="e.g. Move 0.5 BTC to the heir's wallet">
+      <label for="btc-notes">Notes (optional)</label>
+      <textarea id="btc-notes" class="plain" style="min-height:56px" placeholder="What is this one for? e.g. Pays the mortgage from the joint wallet; signed Oct 2026, RBF on."></textarea>
+      <label for="btc-hex">Signed transaction (hex)</label>
+      <textarea id="btc-hex" class="plain" style="min-height:120px" placeholder="02000000…" spellcheck="false"></textarea>
+      <p>
+        <button id="btn-btc-add" class="primary">+ Add transaction</button>
+        <button id="btn-btc-cancel-edit" style="display:none">Cancel</button>
+      </p>
+      <p id="btc-msg" class="muted"></p>
+    </div>
+  </section>
+
+  <!-- ============ SETTINGS ============ -->
+  <section class="tab" id="tab-settings">
+    <div class="card">
+      <h2>Check-in Settings</h2>
+      <div class="row">
+        <div>
+          <label for="set-threshold">Broadcast Threshold</label>
+          <div class="inline-unit"><input id="set-threshold" type="number" min="1" max="3650" value="90"><span>days</span></div>
+        </div>
+      </div>
+      <p>
+        <button id="btn-save-settings" class="primary">Save settings</button>
+      </p>
+      <p id="settings-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Vacation mode</h2>
+      <label><input type="checkbox" id="set-vacation"> Vacation mode — check-ins paused while travelling</label>
+      <label for="set-vacation-until">Vacation until</label>
+      <input id="set-vacation-until" type="date">
+      <p>
+        <button id="btn-save-vacation" class="primary">Save vacation</button>
+      </p>
+      <p id="vacation-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Pause / resume</h2>
+      <p>Current state: <span id="pause-state" class="pill muted">—</span></p>
+      <p class="muted">Checking in also clears a pause automatically — you being alive is the strongest signal.</p>
+      <p><button id="btn-pause">Pause releases</button> <button id="btn-resume">Resume</button></p>
+      <p id="pause-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Bitcoin nodes</h2>
+      <label for="btc-primary-url">Primary node</label>
+      <input id="btc-primary-url" type="text" placeholder="https://mempool.space">
+      <label for="btc-secondary-url">Secondary node</label>
+      <input id="btc-secondary-url" type="text" placeholder="https://blockstream.info/api">
+      <p class="muted">Where the app checks your transactions and broadcasts them: the address of a mempool instance — mempool.space by default, another public instance, or your own mempool on the LAN (e.g. http://192.168.1.10:8999). The primary is tried first; if it does not answer, the secondary is tried. Leave the secondary blank to use the primary alone. This is a mempool API endpoint, not an Electrum server (port 50001) and not a Bitcoin Core RPC address.</p>
+      <p>
+        <button id="btn-btc-save-nodes">Save nodes</button>
+        <button id="btn-btc-test-conn">Test connection</button>
+      </p>
+      <div class="readiness-item">
+        <div class="readiness-label">Primary</div>
+        <div><span id="btc-primary">—</span> <span id="btc-primary-status" class="pill muted">Not tested</span></div>
+      </div>
+      <div class="readiness-item">
+        <div class="readiness-label">Secondary</div>
+        <div><span id="btc-secondary">—</span> <span id="btc-secondary-status" class="pill muted">Not tested</span></div>
+      </div>
+      <p id="btc-nodes-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Check-in API keys</h2>
+      <p class="muted">A key lets a service or app check in for you — a telegram bot, a shortcut, or even your AI assistant. A key can only record a check-in: it cannot read your transactions, broadcast anything, or change settings. Give each service its own key so you can revoke one without touching the others. The key is shown once, when it is created — copy it then.</p>
+      <p>Your connection IP is:<br><code id="api-keys-receiver-url"></code></p>
+      <p class="muted">POST /checkin to check in, GET /health to test — the key goes as an Authorization: Bearer token.</p>
+      <p class="muted">To add it as a custom integration, use:<br>Name: Standby Check-in<br>Base URL: the connection IP above<br>Auth: Bearer token (Authorization: Bearer)<br>Test path: /health<br>API key / token: the key you generate below.</p>
+      <p class="muted">The check-in connection is plain HTTP — keep port 3101 on your trusted LAN and Tailscale network only; never expose it to the internet.</p>
+      <div id="api-keys-list"></div>
+      <label for="api-key-label">Label for the new key</label>
+      <input id="api-key-label" type="text" placeholder="e.g. Check-in bot">
+      <p>
+        <button id="btn-api-key-create" class="primary">Generate key</button>
+      </p>
+      <p id="api-keys-msg" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>Data backup</h2>
+      <p class="muted">Download a backup of everything needed to restore this setup: every signed transaction (hex included), your settings, and the check-in clock, plus the check-in and broadcast history. It is a plain JSON file — keep it somewhere safe. It contains the signed hexes, which reveal the destination addresses and amounts, so treat it like the transactions themselves.</p>
+      <p class="muted">The backup is not encrypted.</p>
+      <p class="inline-btns">
+        <button id="btn-backup-download">Download Backup</button>
+        <button id="btn-backup-restore">Restore</button>
+        <input type="file" id="backup-file" accept="application/json,.json" style="display:none">
+      </p>
+      <p id="backup-msg" class="muted"></p>
+    </div>
+  </section>
+</main>
+
+<!-- Confirmation dialog (Broadcast Now / Broadcast All / Delete) and
+     details pop-out (a broadcast log entry). A native confirm() would
+     work, but this keeps the warning inside the app and testable. -->
+<div id="confirm-modal" class="modal-overlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <button id="modal-x" class="modal-x" aria-label="Close">×</button>
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-body" class="muted"></p>
+    <div id="modal-details"></div>
+    <p>
+      <button id="confirm-proceed" class="danger">Broadcast — I understand</button>
+      <button id="confirm-cancel">Cancel</button>
+    </p>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

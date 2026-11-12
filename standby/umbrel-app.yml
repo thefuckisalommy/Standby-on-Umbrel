@@ -1,0 +1,40 @@
+# Standby — Umbrel app manifest
+# Lives in its own community store (thefuckisalommy/Standby-on-Umbrel),
+# App id `standby`, port 3100.
+manifestVersion: 1
+id: standby
+category: automation
+name: Standby
+version: "0.7.13"
+releaseNotes: "0.7.13: restoring a backup now requires every release record to carry a txid matching the transaction it belongs to — a record with no txid no longer passes validation and can no longer silently disable a transaction; and the app now tells a missing check-in file apart from an unreadable one — when the receiver's check-in state cannot be read, the automatic release is held (not broadcast) until it can be read again, and the dashboard says so. The remaining audit items (concurrent-request writes, receiver rate limiting, parser checks) remain set aside as low priority."
+tagline: Presigned Bitcoin transactions, ready when they're needed.
+description: |-
+  Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.
+
+  Whether you're planning for the unexpected, creating a Bitcoin inheritance plan, or simply keeping a transaction ready for future use, Standby gives you a way to prepare today without needing to act today.
+
+  How it works
+
+  - Prepare: Store presigned Bitcoin transactions for future use.
+  - Broadcast manually: Send a prepared transaction whenever you decide it's time.
+  - Automate: Set up periodic check-ins. If you fail to check in within your configured interval, Standby can automatically broadcast the designated transaction.
+
+  Why Standby?
+
+  Bitcoin gives you control over your money. Standby helps you plan for situations where you might not be available to exercise that control yourself.
+
+  Prepare in advance. Stay in control. Be ready for the unexpected.
+
+  Standby. Ready when you need it.
+developer: Lommy
+website: https://github.com/thefuckisalommy/Standby-on-Umbrel
+dependencies: []
+repo: https://github.com/thefuckisalommy/Standby-on-Umbrel
+support: https://github.com/thefuckisalommy/Standby-on-Umbrel/issues
+port: 3100
+torOnly: false
+icon: https://raw.githubusercontent.com/thefuckisalommy/Standby-on-Umbrel/main/standby/icon.jpg
+gallery:
+  - 1.jpg
+  - 2.jpg
+  - 3.jpg

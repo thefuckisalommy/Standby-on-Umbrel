@@ -1,0 +1,48 @@
+# Standby — Umbrel docker-compose
+# Pattern: Umbrel injects `app_proxy`; the web service is reached via
+# APP_HOST: <app-id>_<service>_1 and APP_PORT (internal port).
+# Do NOT set `user:` on any service (Umbrel guidance).
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: standby_web_1
+      APP_PORT: 3100
+
+  web:
+    # Prebuilt for arm64 by GitHub Actions (.github/workflows/build-heirloom-image.yml)
+    # on every push — installing the app just pulls it, no build step.
+    image: ghcr.io/thefuckisalommy/standby:latest
+    restart: on-failure
+    stop_grace_period: 1m30s
+    environment:
+      PORT: 3100
+      DATA_DIR: /data
+      CHECKIN_DIR: /checkin
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - ${APP_DATA_DIR}/checkin:/checkin
+
+  # Check-in receiver (0.6.6): the check-in-only front door, on the LAN
+  # at port 3101 — NOT behind Umbrel's app-auth proxy, because a key
+  # holder has no Umbrel login. It runs the same image with a different
+  # command, and it mounts ONLY the shared /checkin directory: the key
+  # hashes the app publishes (keys.json) and the check-in timestamps it
+  # writes (last.json). It never mounts /data, so it cannot see the
+  # transactions — even from inside its own container. A key presented
+  # here can only record a check-in; it cannot read, broadcast, or
+  # change anything. The main app merges a newer timestamp from
+  # last.json on every status read and on the hourly tick.
+  checkin:
+    image: ghcr.io/thefuckisalommy/standby:latest
+    command: ["node", "checkin-receiver/server.js"]
+    restart: on-failure
+    stop_grace_period: 1m
+    environment:
+      PORT: 3101
+      CHECKIN_DIR: /checkin
+    volumes:
+      - ${APP_DATA_DIR}/checkin:/checkin
+    ports:
+      - "3101:3101"
