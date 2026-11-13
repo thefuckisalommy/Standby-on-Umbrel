@@ -743,6 +743,66 @@
 
   $('btn-btc-cancel-edit').addEventListener('click', function () { cancelEdit(); });
 
+  // Import a signed transaction from a file: the file's hex is put
+  // in the "Signed transaction" box — it does NOT add the
+  // transaction. The user adds a label/note in the fields and clicks
+  // "+ Add transaction" (the normal paste path) to add it. A hex file
+  // goes straight in the box; a PSBT file is finalized server-side
+  // (preview endpoint) first and the extracted raw hex goes in the
+  // box. A PSBT that is not fully signed is rejected by the server
+  // with the inputs named, and the box is left alone.
+  function base64OfBytes(bytes) {
+    var bin = '';
+    var chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+  $('btn-btc-import-file').addEventListener('click', function () { $('btc-file').click(); });
+  $('btc-file').addEventListener('change', function () {
+    var file = $('btc-file').files && $('btc-file').files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = async function () {
+      try {
+        var bytes = new Uint8Array(reader.result);
+        var text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim();
+        if (/^[0-9a-fA-F]+$/.test(text) && text.length > 0 && text.length % 2 === 0) {
+          // Hex file: put the hex straight in the box.
+          $('btc-hex').value = text;
+          setMsg($('btc-msg'), 'Hex loaded from file — add a label, then Add transaction.', true);
+        } else if (bytes.length >= 5 && bytes[0] === 0x70 && bytes[1] === 0x73 && bytes[2] === 0x62 && bytes[3] === 0x74 && bytes[4] === 0xff) {
+          // Raw binary PSBT: finalize it server-side, then put the
+          // extracted hex in the box. Base64-encoded here so it
+          // survives the JSON body.
+          var r = await api('POST', '/api/bitcoin/txs/preview', { format: 'psbt', data: base64OfBytes(bytes) });
+          $('btc-hex').value = r.hex;
+          setMsg($('btc-msg'), 'PSBT loaded from file — add a label, then Add transaction.', true);
+        } else {
+          // Base64 PSBT text: finalize it server-side the same way.
+          var b64 = text.replace(/\s+/g, '');
+          var decodesToPsbt = false;
+          if (/^[A-Za-z0-9+/]+={0,2}$/.test(b64) && b64.length % 4 === 0) {
+            try { var raw = atob(b64); decodesToPsbt = raw.slice(0, 4) === 'psbt' && raw.charCodeAt(4) === 0xff; } catch (e) { /* not base64 */ }
+          }
+          if (decodesToPsbt) {
+            var r2 = await api('POST', '/api/bitcoin/txs/preview', { format: 'psbt', data: text });
+            $('btc-hex').value = r2.hex;
+            setMsg($('btc-msg'), 'PSBT loaded from file — add a label, then Add transaction.', true);
+          } else {
+            // Neither hex nor a PSBT — say so plainly instead of
+            // sending it as a PSBT and getting a PSBT error back.
+            setMsg($('btc-msg'), 'This file does not look like a signed transaction. Import a plain hex file or a fully-signed PSBT (.psbt).', false);
+          }
+        }
+      } catch (e) { setMsg($('btc-msg'), e.message, false); }
+      $('btc-file').value = '';
+    };
+    reader.onerror = function () { setMsg($('btc-msg'), 'Could not read that file.', false); $('btc-file').value = ''; };
+    reader.readAsArrayBuffer(file);
+  });
+
   // The modal does double duty: a confirmation dialog (Broadcast Now,
   // Broadcast All, Delete — Proceed + Cancel) and a details pop-out
   // (a broadcast log entry — no Proceed, Cancel reads "Close").

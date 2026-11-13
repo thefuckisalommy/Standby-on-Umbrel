@@ -115,10 +115,12 @@
       <input id="btc-label" type="text" placeholder="e.g. Move 0.5 BTC to the heir's wallet">
       <label for="btc-notes">Notes (optional)</label>
       <textarea id="btc-notes" class="plain" style="min-height:56px" placeholder="What is this one for? e.g. Pays the mortgage from the joint wallet; signed Oct 2026, RBF on."></textarea>
-      <label for="btc-hex">Signed transaction (hex)</label>
+      <label for="btc-hex">Signed transaction (hex or PSBT)</label>
       <textarea id="btc-hex" class="plain" style="min-height:120px" placeholder="02000000…" spellcheck="false"></textarea>
       <p>
         <button id="btn-btc-add" class="primary">+ Add transaction</button>
+        <button id="btn-btc-import-file">Import from file…</button>
+        <input type="file" id="btc-file" accept=".txt,.hex,.psbt,text/plain" style="display:none">
         <button id="btn-btc-cancel-edit" style="display:none">Cancel</button>
       </p>
       <p id="btc-msg" class="muted"></p>

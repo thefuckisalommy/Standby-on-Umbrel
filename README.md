@@ -4,11 +4,11 @@ Community app store for [Standby](https://github.com/thefuckisalommy/Standby-on-
 
 Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them. Whether you're planning for the unexpected, creating a Bitcoin inheritance plan, or simply keeping a transaction ready for future use, Standby gives you a way to prepare today without needing to act today.
 
-> **Runs on any umbrelOS device.** The prebuilt image is built for arm64 and amd64, so this app runs on umbrelOS on a Raspberry Pi or on an x86 Umbrel install.
+> **Runs on Umbrel or on any Linux box with Docker.** The prebuilt image is built for arm64 and amd64, so it runs on umbrelOS (Raspberry Pi or x86) and on plain Docker — see [Run on any Linux box (Docker)](#run-on-any-linux-box-docker).
 
 ## Features
 
-- **Prepare in advance** — store presigned Bitcoin transactions for future use. Sign each one in your own wallet and paste the raw signed hex; the app never sees your keys.
+- **Prepare in advance** — store presigned Bitcoin transactions for future use. Sign each one in your own wallet and paste the raw signed hex, or import it from a file — a plain hex file, or a fully-signed PSBT (.psbt); the app never sees your keys.
 - **Broadcast manually** — send a prepared transaction whenever you decide it's time.
 - **Automate with check-ins** — set a check-in interval. If you stop checking in past it, Standby broadcasts the transactions you armed.
 - **Check in from anywhere** — from the app, or with a check-in API key: one address works for any connection (a bot, a shortcut, a script, or any HTTP client). A key can only record a check-in.
@@ -18,7 +18,7 @@ Standby helps you prepare Bitcoin transactions in advance and keep them ready fo
 
 ## How it works
 
-- You sign a transaction in your own wallet and paste the raw signed hex into Standby.
+- You sign a transaction in your own wallet and paste the raw signed hex into Standby — or import it from a file (a plain hex file, or a fully-signed PSBT; a PSBT that is not fully signed is rejected).
 - The app validates the structure and watches the inputs: spend an input with a confirmed transaction and it goes stale — it will never be broadcast; spend it with an unconfirmed one and it warns instead; and if the spending transaction is our own, the transaction is already out there, so it is recorded as broadcast.
 - You check in on your schedule, from the app or from any device with a check-in API key.
 - If you stop checking in past the broadcast threshold, Standby broadcasts the transactions you armed, in order.
@@ -35,12 +35,15 @@ https://github.com/thefuckisalommy/Standby-on-Umbrel
 
 Then install Standby from the store. The app's Docker image is built for arm64 and amd64 by GitHub Actions on every push and published to GHCR, so installing just pulls it.
 
-After installing, open the app and add your first transaction: sign it in your own wallet, paste the raw signed hex, and arm it. Set the check-in interval in Settings, then check in — from the app, or by creating a check-in API key for your gadget, shortcut, bot, or script.
+After installing, open the app and add your first transaction: sign it in your own wallet, paste the raw signed hex (or import a hex file or a fully-signed PSBT), and arm it. Set the check-in interval in Settings, then check in — from the app, or by creating a check-in API key for your gadget, shortcut, bot, or script.
 
 ## Run on any Linux box (Docker)
 
-No Umbrel needed. On any Linux machine with Docker and the Compose plugin (amd64 or arm64 — the image is multi-arch):
+No Umbrel needed. Standby is a plain Docker image (`ghcr.io/thefuckisalommy/standby:latest`, multi-arch amd64 and arm64) that runs anywhere Docker runs. It is two services from the same image: the web UI, and a check-in receiver that only records check-ins.
 
+**Prerequisites:** Docker Engine and the Compose plugin. If you don't have them, follow the [Docker Engine install docs](https://docs.docker.com/engine/install/) for your distro, then confirm with `docker compose version`.
+
+**Start it:**
 ```sh
 mkdir standby && cd standby
 curl -O https://raw.githubusercontent.com/thefuckisalommy/Standby-on-Umbrel/main/docker-compose.yml
@@ -48,21 +51,41 @@ docker compose up -d
 # open http://localhost:3100
 ```
 
-The web UI listens on localhost only by default (`127.0.0.1:3100`) — there is no login screen on this path, so it is not exposed to your network. Reach it on the box itself, over SSH (`ssh -L 3100:localhost:3100 <box>`), over Tailscale, or behind your own reverse proxy with auth. To open it to your LAN instead, change the web port line to `"${STANDBY_WEB_PORT:-3100}:3100"` — only on a network you trust.
+**What is running:**
+- `web` — the Standby UI and API, on port 3100. It listens on localhost only (`127.0.0.1:3100`) by default.
+- `checkin` — the check-in receiver, on port 3101. It runs the same image with `node checkin-receiver/server.js` and mounts only the shared `./checkin` directory, so it can record a check-in but cannot see or change your transactions.
 
-The check-in receiver listens on port 3101 for API-key check-ins, same as on Umbrel: `curl -X POST http://<box>:3101/checkin -H "Authorization: Bearer <your key>"`. It is plain HTTP, protected only by the key — keep it on your trusted LAN or Tailscale network, as in [SECURITY.md](SECURITY.md).
+**Ports:** override with `STANDBY_WEB_PORT` (default 3100) and `STANDBY_CHECKIN_PORT` (default 3101), e.g. `STANDBY_WEB_PORT=8080 docker compose up -d`.
 
-Data lives in `./data` and `./checkin` next to the compose file, as plain files. Back up by copying those two directories, or use the in-app Backup download; restore with the in-app Restore. Everything else — signing, arming, check-ins, releases — works exactly as on Umbrel.
+**Reaching the UI:** there is no login screen on this path, and the web UI is localhost-only by default — it is not exposed to your network. Reach it on the box itself, over SSH (`ssh -L 3100:localhost:3100 <box>`), over Tailscale, or behind your own reverse proxy with auth. To open it to your LAN instead, change the web port line in `docker-compose.yml` to `"${STANDBY_WEB_PORT:-3100}:3100"` — only on a network you trust.
 
-## Run locally
+**Check-ins:** the receiver listens on port 3101 for API-key check-ins, same as on Umbrel: `curl -X POST http://<box>:3101/checkin -H "Authorization: Bearer <your key>"`. It is plain HTTP, protected only by the key — keep it on your trusted LAN or Tailscale network, as in [SECURITY.md](SECURITY.md).
 
+**Data:** lives in `./data` (app state) and `./checkin` (receiver state) next to the compose file, as plain files. Back up by copying those two directories, or use the in-app Backup download; restore with the in-app Restore.
+
+**Updating:** `docker compose pull && docker compose up -d` — pulls the new `:latest` image and restarts both services. Your data in `./data` and `./checkin` is untouched.
+
+**Stopping:** `docker compose down` stops both services. It does not delete `./data` or `./checkin` — delete those directories yourself to wipe everything.
+
+Everything else — signing, arming, check-ins, releases — works exactly as on Umbrel.
+
+**Without Compose (plain `docker run`):**
 ```sh
-docker build -t standby standby
-docker run --rm -p 3100:3100 -v "$PWD/data:/data" standby
+mkdir -p data checkin
+docker run -d --name standby-web --restart on-failure -p 127.0.0.1:3100:3100 -v "$PWD/data:/data" -v "$PWD/checkin:/checkin" ghcr.io/thefuckisalommy/standby:latest
+docker run -d --name standby-checkin --restart on-failure -p 3101:3101 -v "$PWD/checkin:/checkin" -e PORT=3101 -e CHECKIN_DIR=/checkin ghcr.io/thefuckisalommy/standby:latest node checkin-receiver/server.js
 # open http://localhost:3100
 ```
 
-Or plain Node 24+: `cd standby && node server.js` — same port, same data volume.
+**Build it yourself / run from source:**
+```sh
+git clone https://github.com/thefuckisalommy/Standby-on-Umbrel.git
+docker build -t standby Standby-on-Umbrel/standby
+docker run --rm -p 127.0.0.1:3100:3100 -v "$PWD/data:/data" -v "$PWD/checkin:/checkin" standby
+# open http://localhost:3100
+```
+
+Or plain Node 24+ (no Docker): `cd Standby-on-Umbrel/standby && node server.js` — same port, data in `./data` next to the server.
 
 ## Check-in API keys
 

@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.14';
+const VERSION = '0.7.15';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -999,18 +999,17 @@ async function handleApi(req, res, pathname) {
   // PUT    /api/bitcoin/txs/:id  — update { txHex?, label?, notes?, enabled? }
   // DELETE /api/bitcoin/txs/:id  — remove
   const txsMatch = pathname.match(/^\/api\/bitcoin\/txs\/([^/]+)$/);
-  if (req.method === 'POST' && pathname === '/api/bitcoin/txs') {
-    const body = await readBody(req);
-    if (typeof body.txHex !== 'string' || !body.txHex.trim()) return sendError(res, 400, 'empty transaction hex');
-    let parsed;
-    try { parsed = bitcoin.parseTx(body.txHex.trim()); }
-    catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
-    const tx = {
+  // One stored-transaction record, from a parsed tx and its hex —
+  // shared by the paste path (POST /api/bitcoin/txs) and the file
+  // import path (POST /api/bitcoin/txs/import), so the two cannot
+  // drift apart.
+  function newTxRecord(parsed, hex, label, notes) {
+    return {
       id: store.newTxId(),
       txid: parsed.txid,
-      hex: body.txHex.trim(),
-      label: typeof body.label === 'string' ? asStr(body.label, 80) : '',
-      notes: typeof body.notes === 'string' ? asStr(body.notes, 500) : '',
+      hex,
+      label: typeof label === 'string' ? asStr(label, 80) : '',
+      notes: typeof notes === 'string' ? asStr(notes, 500) : '',
       createdAt: now.toISOString(),
       inputs: parsed.inputs.length,
       outputs: parsed.outputs.length,
@@ -1024,6 +1023,105 @@ async function handleApi(req, res, pathname) {
       // confirmations, blockHeight, found, checkedAt }.
       broadcasted: null,
     };
+  }
+  // A transaction is identified by its txid: the same on-chain
+  // transaction stored twice is two cards, both armed, for one
+  // Bitcoin tx (the second broadcast is a no-op). Reject a txid
+  // that is already stored, naming the existing card by its label
+  // (or its id when it has no label). `exceptId` is the tx being
+  // edited — its own txid is not a duplicate.
+  function duplicateTx(txid, exceptId) {
+    const dup = (state.bitcoin.txs || []).find((t) => t.txid === txid && t.id !== exceptId);
+    return dup ? "This transaction is already stored as '" + (dup.label || dup.id) + "'" : null;
+  }
+  if (req.method === 'POST' && pathname === '/api/bitcoin/txs') {
+    const body = await readBody(req);
+    if (typeof body.txHex !== 'string' || !body.txHex.trim()) return sendError(res, 400, 'empty transaction hex');
+    const input = body.txHex.trim();
+    let hex;
+    if (/^[0-9a-fA-F]+$/.test(input) && input.length % 2 === 0) {
+      // Clean hex — the original paste path.
+      hex = input;
+    } else {
+      // Maybe a pasted PSBT (base64). extractTxFromPsbt detects the
+      // format by content. A PSBT that parses but is not fully
+      // signed reports its own error (naming the inputs); anything
+      // that is not a PSBT at all is an invalid paste, like a
+      // corrupt hex.
+      try { hex = bitcoin.extractTxFromPsbt(input).hex; }
+      catch (e) {
+        if (e.message.indexOf('not fully signed') !== -1) return sendError(res, 400, e.message);
+        return sendError(res, 400, 'invalid transaction: ' + e.message);
+      }
+    }
+    let parsed;
+    try { parsed = bitcoin.parseTx(hex); }
+    catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+    const dupErr = duplicateTx(parsed.txid);
+    if (dupErr) return sendError(res, 400, dupErr);
+    const tx = newTxRecord(parsed, hex, body.label, body.notes);
+    state.bitcoin.txs.push(tx);
+    store.saveState(DATA_DIR, state);
+    return sendJson(res, 201, { tx });
+  }
+
+  // POST /api/bitcoin/txs/preview — finalize a file's contents and
+  // return the raw hex WITHOUT storing anything. The UI calls this
+  // when a PSBT file is imported, so the extracted hex can be put
+  // in the textarea for the user to label and add via the normal
+  // paste path. Body { format: 'hex'|'psbt', data }. Hex is
+  // validated exactly like the paste path; a PSBT is finalized
+  // exactly like the import path (same errors, including the
+  // clearer "not a PSBT file" one). No state change.
+  if (req.method === 'POST' && pathname === '/api/bitcoin/txs/preview') {
+    const body = await readBody(req);
+    if (body.format !== 'hex' && body.format !== 'psbt') return sendError(res, 400, 'import format must be hex or psbt');
+    if (typeof body.data !== 'string' || !body.data.trim()) return sendError(res, 400, 'empty import data');
+    let hex;
+    if (body.format === 'hex') {
+      try { bitcoin.parseTx(body.data.trim()); }
+      catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+      hex = body.data.trim();
+    } else {
+      try { hex = bitcoin.extractTxFromPsbt(body.data).hex; }
+      catch (e) { return sendError(res, 400, e.message); }
+    }
+    let parsed;
+    try { parsed = bitcoin.parseTx(hex); }
+    catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+    return sendJson(res, 200, { hex, txid: parsed.txid });
+  }
+
+  // POST /api/bitcoin/txs/import — add a signed transaction from a
+  // FILE instead of a paste. Body { format: 'hex'|'psbt', data,
+  // label?, notes? }. A hex file is a text file holding the raw
+  // transaction hex; it is validated exactly like the paste path
+  // (same errors). A PSBT file (.psbt, base64 or raw binary) is
+  // finalized server-side — the PSBT must be fully signed, or it is
+  // rejected with a clear error naming the inputs that are missing
+  // signatures; a partially signed PSBT is never stored. The
+  // extracted raw hex is validated by parseTx exactly like a paste
+  // before it is stored. The body is capped at 1 MB (MAX_BODY), and
+  // the PSBT parser caps the decoded PSBT at 1 MB too.
+  if (req.method === 'POST' && pathname === '/api/bitcoin/txs/import') {
+    const body = await readBody(req);
+    if (body.format !== 'hex' && body.format !== 'psbt') return sendError(res, 400, 'import format must be hex or psbt');
+    if (typeof body.data !== 'string' || !body.data.trim()) return sendError(res, 400, 'empty import data');
+    let hex;
+    if (body.format === 'hex') {
+      try { bitcoin.parseTx(body.data.trim()); }
+      catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+      hex = body.data.trim();
+    } else {
+      try { hex = bitcoin.extractTxFromPsbt(body.data).hex; }
+      catch (e) { return sendError(res, 400, e.message); }
+    }
+    let parsed;
+    try { parsed = bitcoin.parseTx(hex); }
+    catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+    const dupErr = duplicateTx(parsed.txid);
+    if (dupErr) return sendError(res, 400, dupErr);
+    const tx = newTxRecord(parsed, hex, body.label, body.notes);
     state.bitcoin.txs.push(tx);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 201, { tx });
@@ -1043,6 +1141,10 @@ async function handleApi(req, res, pathname) {
       let parsed;
       try { parsed = bitcoin.parseTx(hex); }
       catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
+      // A replacement hex that is another stored transaction's txid
+      // is a duplicate; the tx's own hex (unchanged) is fine.
+      const dupErr = duplicateTx(parsed.txid, tx.id);
+      if (dupErr) return sendError(res, 400, dupErr);
       tx.hex = hex;
       tx.txid = parsed.txid;
       tx.inputs = parsed.inputs.length;

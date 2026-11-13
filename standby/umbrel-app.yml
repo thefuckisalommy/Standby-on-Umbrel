@@ -5,8 +5,8 @@ manifestVersion: 1
 id: standby
 category: automation
 name: Standby
-version: "0.7.14"
-releaseNotes: "0.7.14: a failed broadcast is now retried on the next hourly check instead of ending the release — if one armed transaction broadcasts and another fails for an unknown reason, the status stays Release Due and the failed one is tried again every hour until it succeeds or its inputs are spent; and the dry-run now warns when a transaction carries an absolute locktime that has not passed yet, reporting it as timelocked with the block height or date it unlocks, instead of calling it ready."
+version: "0.7.15"
+releaseNotes: "0.7.15: you can now import a signed transaction from a file instead of pasting the hex — a plain hex file, or a fully-signed PSBT (.psbt, base64 or raw binary). A PSBT is finalized on the server (P2PKH, P2WPKH, P2SH-P2WPKH, and P2WSH including M-of-N multisig) and the extracted transaction is validated exactly like a paste; a PSBT that is not fully signed is rejected, naming the inputs that are missing signatures."
 tagline: Presigned Bitcoin transactions, ready when they're needed.
 description: |-
   Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.
