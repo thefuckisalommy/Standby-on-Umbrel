@@ -696,6 +696,159 @@ async function broadcastViaApi(hex, txid, apiBase) {
 }
 
 // ---------------------------------------------------------------------------
+// MARA Slipstream — a direct-to-miner broadcast route (0.7.16). A
+// transaction submitted here goes straight to MARA Pool's private
+// mempool, bypassing the public mempool entirely: it stays private
+// until MARA mines it into a block. That is the point (a sensitive
+// move nobody else can see before it confirms) and the limit (MARA
+// is ~5% of hashrate, so a Slipstream-only transaction can wait, and
+// admission is best-effort — it does not guarantee a block). The
+// public nodes stay for every read/verify job (input freshness,
+// confirmations, tip height): Slipstream has no outspend lookup and
+// no general tx search, so it cannot replace them.
+//   Submit: POST /api/transactions, JSON {"tx_hex": "<hex>"}.
+//     Success = HTTP 200 AND a parsed body with status === "success".
+//     Failure = HTTP 400 with {"status": "error", "message": reason}
+//     — the reason is surfaced. Anything else (a non-JSON body, a
+//     403, a Cloudflare challenge, an unexpected shape) fails closed:
+//     it is a failed submission, never a success. No auth, no API key.
+//     The API is beta (0.1.0-beta) — unexpected shapes fail closed.
+//   Status: GET /api/transactions/status?tx_id=<txid> returns a
+//     TransactionInfo (message, market_rate, functional_rate,
+//     last_24h_odds, last_7d_odds, is_next_block, and a transaction
+//     object with status {confirmed, block_height, block_time},
+//     firstSeen, position, plus submission_type and package_txids).
+//     The base URL is SLIPSTREAM_API_URL when set (tests point it at
+//     the stub so they never touch the real slipstream.mara.com).
+//   Fee floor: the minimum submission rate is the higher of 2x the
+//     current mempool priority fee rate or 2 sat/vB (GET
+//     /api/block-info returns submit_fee_rate). There is deliberately
+//     NO local fee-rate pre-check here — computing the fee rate needs
+//     the input values, which this app does not fetch; the submission
+//     is attempted and Slipstream's rejection reason is surfaced if
+//     the fee is too low.
+// ---------------------------------------------------------------------------
+const DEFAULT_SLIPSTREAM_API_URL = 'https://slipstream.mara.com';
+
+function slipstreamBase() {
+  const v = (process.env.SLIPSTREAM_API_URL || '').trim();
+  if (!v) return DEFAULT_SLIPSTREAM_API_URL;
+  let u;
+  try { u = new URL(v); } catch { throw new Error('invalid Slipstream URL: ' + v); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Slipstream URL must be http(s): ' + v);
+  return u.protocol + '//' + u.host;
+}
+
+function slipstreamReq(path, method, body) {
+  const base = slipstreamBase();
+  const u = new URL(base);
+  return requestText({
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80),
+    path,
+    method: method || 'GET',
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    body,
+  });
+}
+
+// Submit one signed transaction to MARA Slipstream. Returns
+// { txid, method: 'slipstream' } on success. Throws on any failure —
+// the caller records it as a failed broadcast and retries (the
+// selected route, Slipstream, is retried; there is no fallback to
+// the public nodes). A transaction Slipstream already knows (a
+// re-submit after a lost reply) answers success again, so a
+// duplicate submit is harmless.
+async function broadcastViaSlipstream(hex, txid) {
+  let res;
+  try {
+    res = await slipstreamReq('/api/transactions', 'POST', JSON.stringify({ tx_hex: hex }));
+  } catch (e) {
+    throw new Error('could not reach Slipstream: ' + e.message);
+  }
+  let parsed = null;
+  try { parsed = JSON.parse(res.body); } catch { parsed = null; }
+  if (res.status === 200 && parsed && parsed.status === 'success') {
+    return { txid, method: 'slipstream' };
+  }
+  // A 400 carries the reason in body.message — surface it (a fee
+  // below the floor, a sanctions rejection, an invalid tx). Anything
+  // else — a non-JSON body, a 403, a Cloudflare challenge, a 200
+  // with an unexpected shape — is a failed submission, never a
+  // success: fail closed.
+  if (parsed && typeof parsed.message === 'string' && parsed.message) {
+    throw new Error('Slipstream rejected the transaction (HTTP ' + res.status + '): ' + parsed.message.slice(0, 200));
+  }
+  throw new Error('Slipstream rejected the transaction (HTTP ' + res.status + '): ' + res.body.slice(0, 200));
+}
+
+// Where is a Slipstream-submitted transaction? Returns a normalized
+// { state, position, isNextBlock, last24hOdds, last7dOdds, confirmed,
+// blockHeight, message } where state is:
+//   'queued'    — Slipstream knows it and it is waiting (not confirmed).
+//   'confirmed' — Slipstream reports it confirmed (mined into a block).
+//   'failed'    — Slipstream does not know it any more (404, or a
+//                 200 with no transaction object): it was dropped
+//                 from MARA's queue. The caller treats this as a
+//                 failed broadcast and retries via Slipstream.
+//   'unknown'   — the status check itself failed (endpoint down,
+//                 non-JSON, unexpected shape): do NOT assume the
+//                 transaction is gone — leave it waiting and check
+//                 again next tick.
+async function getSlipstreamTxStatus(txid) {
+  let res;
+  try {
+    res = await slipstreamReq('/api/transactions/status?tx_id=' + encodeURIComponent(txid), 'GET');
+  } catch (e) {
+    return { state: 'unknown', message: 'could not reach Slipstream: ' + e.message };
+  }
+  if (res.status === 404) {
+    return { state: 'failed', message: 'Slipstream does not list this transaction' };
+  }
+  if (res.status !== 200) {
+    return { state: 'unknown', message: 'Slipstream status check failed (HTTP ' + res.status + ')' };
+  }
+  let parsed = null;
+  try { parsed = JSON.parse(res.body); } catch { parsed = null; }
+  if (!parsed || typeof parsed !== 'object') {
+    return { state: 'unknown', message: 'Slipstream status reply was not JSON' };
+  }
+  // A 200 carrying status 'error' is Slipstream saying it does not
+  // know the transaction (the same as a 404).
+  if (parsed.status === 'error') {
+    return { state: 'failed', message: (typeof parsed.message === 'string' && parsed.message) || 'Slipstream does not list this transaction' };
+  }
+  const info = parsed.transaction;
+  if (!info || typeof info !== 'object') {
+    return { state: 'failed', message: (typeof parsed.message === 'string' && parsed.message) || 'Slipstream does not list this transaction' };
+  }
+  const st = info.status || {};
+  if (st.confirmed === true) {
+    return {
+      state: 'confirmed',
+      position: typeof info.position === 'number' ? info.position : null,
+      isNextBlock: parsed.is_next_block === true,
+      last24hOdds: typeof parsed.last_24h_odds === 'number' ? parsed.last_24h_odds : null,
+      last7dOdds: typeof parsed.last_7d_odds === 'number' ? parsed.last_7d_odds : null,
+      confirmed: true,
+      blockHeight: Number.isFinite(st.block_height) ? st.block_height : null,
+      message: (typeof parsed.message === 'string' && parsed.message) || '',
+    };
+  }
+  return {
+    state: 'queued',
+    position: typeof info.position === 'number' ? info.position : null,
+    isNextBlock: parsed.is_next_block === true,
+    last24hOdds: typeof parsed.last_24h_odds === 'number' ? parsed.last_24h_odds : null,
+    last7dOdds: typeof parsed.last_7d_odds === 'number' ? parsed.last_7d_odds : null,
+    confirmed: false,
+    blockHeight: null,
+    message: (typeof parsed.message === 'string' && parsed.message) || '',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Input freshness — is each input still unspent?
 // ---------------------------------------------------------------------------
 
@@ -833,17 +986,25 @@ async function dryRun(dataDir, { tx, endpoints }) {
     : check.conflict.length ? 'conflict'
     : check.unknown.length ? 'unknown' : 'ready';
   const wouldBroadcast = check.spent.length === 0 && check.own.length === 0;
+  // The route this transaction would take (0.7.16): the dry-run note
+  // names it, so a Slipstream transaction says "would submit to
+  // Slipstream" instead of "would broadcast". The freshness gate is
+  // the same for both routes — a spent input still means stale, never
+  // submitted — only the wording changes.
+  const viaSlipstream = tx.broadcastVia === 'slipstream';
+  const attempt = viaSlipstream ? 'a submission to Slipstream (MARA)' : 'a broadcast';
+  const rejecter = viaSlipstream ? 'Slipstream' : 'the node';
   const note = verdict === 'ready'
-    ? 'All ' + check.checked + ' input(s) unspent — a broadcast would be attempted. ' + viaNote
+    ? 'All ' + check.checked + ' input(s) unspent — ' + attempt + ' would be attempted. ' + viaNote
     : verdict === 'blocked'
-      ? check.spent.length + ' input(s) no longer unspent — this transaction is stale and will not be broadcast. ' + viaNote
+      ? check.spent.length + ' input(s) no longer unspent — this transaction is stale and will not be ' + (viaSlipstream ? 'submitted to Slipstream' : 'broadcast') + '. ' + viaNote
       : verdict === 'broadcast'
         ? 'This transaction is already out there — the node reports its own txid as the spending transaction — so it is recorded as broadcast. Nothing was sent. ' + viaNote
         : verdict === 'timelocked'
-          ? 'This transaction is timelocked until ' + (typeof timelock.until === 'number' ? 'block ' + timelock.until : timelock.until.toISOString()) + ' — the node would reject it as non-final until then, so a broadcast would be attempted and rejected; it will be retried on the next hourly check. ' + viaNote
+          ? 'This transaction is timelocked until ' + (typeof timelock.until === 'number' ? 'block ' + timelock.until : timelock.until.toISOString()) + ' — ' + rejecter + ' would reject it as non-final until then, so ' + attempt + ' would be attempted and rejected; it will be retried on the next hourly check. ' + viaNote
           : verdict === 'conflict'
-          ? check.conflict.length + ' input(s) are spent by another transaction that is not confirmed yet — the spend may still be evicted, so this transaction stays active with a warning and a broadcast will still be attempted. ' + viaNote
-          : check.unknown.length + ' input(s) could not be verified — broadcast would be attempted, but the network is the arbiter. ' + viaNote;
+          ? check.conflict.length + ' input(s) are spent by another transaction that is not confirmed yet — the spend may still be evicted, so this transaction stays active with a warning and ' + attempt + ' will still be attempted. ' + viaNote
+          : check.unknown.length + ' input(s) could not be verified — ' + attempt + ' would be attempted, but the network is the arbiter. ' + viaNote;
   appendBroadcastLog(dataDir, {
     ts: new Date().toISOString(),
     kind: 'dry-run',
@@ -863,6 +1024,7 @@ async function dryRun(dataDir, { tx, endpoints }) {
     ok: true,
     wouldBroadcast,
     verdict,
+    broadcastVia: tx.broadcastVia === 'slipstream' ? 'slipstream' : 'public',
     timelockedUntil: timelock.timelocked ? (timelock.until instanceof Date ? timelock.until.toISOString() : timelock.until) : null,
     txid: tx.txid,
     checked: check.checked,
@@ -883,7 +1045,7 @@ async function dryRun(dataDir, { tx, endpoints }) {
 // is the endpoint that actually broadcast ('primary'|'secondary').
 // Throws on total failure (and logs it). A broadcast that lands is
 // irrevocable; a failed attempt is retried by the caller.
-async function broadcastTx(dataDir, { hex, txid, endpoints }) {
+async function broadcastTx(dataDir, { hex, txid, endpoints, notePrefix }) {
   const errors = [];
   for (const ep of endpoints) {
     try {
@@ -896,7 +1058,7 @@ async function broadcastTx(dataDir, { hex, txid, endpoints }) {
         method: ep.label,
         txid: outTxid,
         hexPreview: hex.slice(0, 64),
-        note: 'Broadcast accepted by the ' + ep.label + ' node (' + mempoolHostLabel(ep.base) + ')'
+        note: (notePrefix ? notePrefix + ' ' : '') + 'Broadcast accepted by the ' + ep.label + ' node (' + mempoolHostLabel(ep.base) + ')'
           + (fellBack ? ' — the primary node failed (' + (errors[0] || '') + '), fell back to the secondary.' : '.'),
       });
       return { txid: outTxid, method: ep.label, fallback: fellBack };
@@ -1040,6 +1202,8 @@ async function testOnePath(apiBase) {
 module.exports = {
   parseTx, extractTxFromPsbt, checkInputsUnspent, dryRun, broadcastTx, testConnection,
   getConfirmations, findSharedInputs, timelockedUntil,
+  broadcastViaSlipstream, getSlipstreamTxStatus,
   normalizePublicApiUrl, mempoolBase, endpointsFor,
   DEFAULT_PUBLIC_API_URL, DEFAULT_SECONDARY_API_URL,
+  DEFAULT_SLIPSTREAM_API_URL,
 };

@@ -28,9 +28,9 @@ function defaultState() {
     // and its own release record. The stored tx is raw signed hex ONLY —
     // the server never sees keys.
     // tx = { id, txid, hex, label, notes, createdAt, inputs, outputs,
-    //   totalOutSats, locktime, segwit, enabled,
-    //   release: null | { status: 'broadcast'|'failed'|'stale', txid,
-    //     method, broadcastedAt | lastAttemptAt, error? },
+    //   totalOutSats, locktime, segwit, enabled, broadcastVia,
+    //   release: null | { status: 'broadcast'|'failed'|'stale'|'submitted-slipstream', txid,
+    //     method, broadcastedAt | lastAttemptAt, error?, mara? },
     //   broadcasted: null | { txid, broadcastedAt, method,
     //     confirmations, blockHeight, found, checkedAt } }
     // release is the current cycle's record (a check-in clears it);

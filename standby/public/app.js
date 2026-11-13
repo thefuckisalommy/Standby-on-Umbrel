@@ -166,15 +166,16 @@
     $('next-due').textContent = status.nextDue
       ? fmtDateShort(status.nextDue) + ' (' + fmtDays(daysUntil(status.nextDue)) + ')'
       : '—';
-    // The count is the transactions NOT in the Archived Transactions
-    // card (broadcasted or stale) — the archived ones will never
+    // The count is the transactions NOT in the Archived or Pending
+    // Transactions cards (broadcasted, stale, or still waiting for
+    // a confirmation) — the archived and pending ones will never
     // broadcast at release, so they are not counted here.
-    var activeTxs = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled; });
+    var activeTxs = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
     var armedActive = activeTxs.filter(function (t) { return t.enabled; }).length;
     $('readiness-btc').textContent = activeTxs.length
       ? armedActive + ' of ' + activeTxs.length + ' transaction(s) armed'
       : (S.bitcoin.txs || []).length
-        ? 'No active transactions — every stored transaction is archived'
+        ? 'No active transactions — every stored transaction is pending or archived'
         : 'No transactions stored (no broadcast at release)';
     // One "Node Status" item, with the Primary and Secondary lines
     // listed below it (each with its own status pill). The status comes
@@ -249,6 +250,36 @@
   // each tx is for, at a glance, in the list.
   var editingId = null; // id of the tx loaded into the add form, or null
   var dryRunResults = {}; // tx id -> { text, ok, verdict, spent, unknown, error }: the last dry-run result per transaction, shown in its own card. The *line* is page memory only — but a spent verdict is also recorded on the transaction server-side (a stale release record), a conflict verdict the same way (a conflict release record — a warning, not a verdict), and an own-txid verdict as a broadcast record, so the Stale / Conflict / Broadcasted status itself survives a refresh.
+  // The public fallback (0.7.17): a per-transaction opt-in timer on a
+  // Slipstream-route transaction — if MARA has not confirmed it
+  // within the chosen days, Standby broadcasts it publicly instead.
+  // The same seven durations the server accepts, plus Never (null).
+  var FALLBACK_DAYS = [1, 3, 7, 14, 30, 60, 90];
+  // The one-sentence explainer under the Add form's fallback select
+  // (0.7.17): what the chosen duration means. Never means MARA
+  // holds it until it is mined or dropped — no automatic fallback.
+  function fallbackAddNote(days) {
+    if (days === null || days === undefined || days === '') return 'No automatic fallback \u2014 it stays with MARA until mined or dropped.';
+    return 'If MARA hasn\u2019t confirmed it within ' + fallbackLabel(days) + ', Standby broadcasts it publicly instead.';
+  }
+  function fallbackLabel(days) {
+    if (days === null || days === undefined || days === '') return 'Never';
+    return days + (days === 1 ? ' day' : ' days');
+  }
+  // Days left before a Slipstream-pending tx's public fallback fires
+  // — from the deadline (submittedAt + duration) to now, rounded up,
+  // so a deadline later today still reads as a day left. Never (null)
+  // has no deadline; a passed deadline reads as due.
+  function fallbackCountdown(tx) {
+    var days = tx.publicFallbackDays;
+    if (days === null || days === undefined) return '(No automatic fallback)';
+    var submittedAt = tx.release && tx.release.submittedAt;
+    if (!submittedAt) return '(No automatic fallback)';
+    var deadline = new Date(submittedAt).getTime() + days * 86400000;
+    var left = Math.ceil((deadline - Date.now()) / 86400000);
+    if (left <= 0) return '(fallback due \u2014 broadcasts publicly on the next hourly check)';
+    return '(' + left + (left === 1 ? ' day' : ' days') + ' left before fallback)';
+  }
   var txCardEls = {}; // tx id -> { row, sentLine }: the rendered card, so the confirmations poll can update the sent line in place
 
   function txStats(tx) {
@@ -294,7 +325,24 @@
       : m === 'node' ? 'own node'
       : m === 'api' ? 'public API'
       : m === 'both' ? 'own node + public API'
+      : m === 'slipstream' ? 'Slipstream (MARA)'
       : (m || '');
+  }
+
+  // The MARA queue line for a Slipstream-submitted transaction:
+  // where it sits in MARA's queue and how likely it is to be mined
+  // soon, from the last status check. Only shown while waiting.
+  function txMaraLine(tx) {
+    var rel = tx.release;
+    if (!rel || rel.status !== 'submitted-slipstream') return '';
+    var m = rel.mara || {};
+    var bits = [];
+    if (typeof m.position === 'number') bits.push('position ' + m.position + ' in MARA\u2019s queue');
+    if (m.isNextBlock === true) bits.push('likely in the next block');
+    else if (typeof m.last24hOdds === 'number') bits.push(Math.round(m.last24hOdds * 100) + '% mined in the last 24h');
+    else if (typeof m.last7dOdds === 'number') bits.push(Math.round(m.last7dOdds * 100) + '% mined in the last 7 days');
+    if (!bits.length) return '';
+    return 'Slipstream queue: ' + bits.join(', ') + '.';
   }
 
   // The broadcasted line for a sent transaction: when it went out, via
@@ -322,6 +370,16 @@
     if (!rel) return '';
     if (rel.status === 'broadcast') return 'Broadcast ' + fmtDate(rel.broadcastedAt) + ' via ' + methodLabel(rel.method) + '.';
     if (rel.status === 'stale') return 'Stale — ' + (rel.error || 'inputs spent') + '. Replace the transaction to re-arm.';
+    // A Slipstream submission is a pseudo-pending-but-success state:
+    // it went to MARA, it is not in the public mempool yet, and it
+    // becomes Broadcasted once the public nodes see it — or Failed
+    // if MARA drops it. The queue line (when the last status check
+    // brought one back) says where it sits.
+    if (rel.status === 'submitted-slipstream') {
+      var line = 'Submitted to Slipstream (MARA) ' + fmtDate(rel.submittedAt) + ' — waiting for MARA to mine it.';
+      var mara = txMaraLine(tx);
+      return mara ? line + ' ' + mara : line;
+    }
     return 'Failed — ' + (rel.error || 'unknown error') + '. Will retry on the next hourly check.';
   }
 
@@ -330,30 +388,62 @@
   // network no longer knows is Failed — the node accepted it, then
   // it was dropped from the mempool (or replaced by the other
   // transaction sharing its inputs); the broadcast line on the card
-  // says so. A broadcasted tx the network knows is Broadcasted (and
-  // a release record that says 'broadcast' counts as Broadcasted
-  // even without the broadcasted fact — a restore can carry one half
-  // of the pair); inputs declared spent is Stale — the spent verdict
-  // is recorded on the transaction (by the release, a manual
-  // broadcast, or a dry-run), so it survives refreshes and check-ins
-  // and the card stays in the Archived Transactions card; an input
-  // spent by another transaction that is NOT confirmed yet is
-  // Conflict — a warning, not a verdict: the card stays active (not
-  // archived, not stale) and a broadcast is still attempted, and a
-  // later clean check clears it; a dry-run that could not reach the
+  // says so. A broadcasted tx that is CONFIRMED (confirmations > 0,
+  // or a block height set) is Broadcasted (green, archived); a
+  // broadcasted tx that is NOT yet confirmed — in the mempool, or
+  // not checked yet (confirmations null) — is Broadcast (amber,
+  // pending): it is out the door but not settled yet. A release
+  // record that says 'broadcast' counts as Broadcasted even without
+  // the broadcasted fact — a restore can carry one half of the
+  // pair, and there is no confirmation count to consult for it.
+  // Inputs declared spent is Stale — the spent verdict is recorded
+  // on the transaction (by the release, a manual broadcast, or a
+  // dry-run), so it survives refreshes and check-ins and the card
+  // stays in the Archived Transactions card; an input spent by
+  // another transaction that is NOT confirmed yet is Conflict — a
+  // warning, not a verdict: the card stays active (not archived,
+  // not stale) and a broadcast is still attempted, and a later
+  // clean check clears it; a dry-run that could not reach the
   // nodes is Node Failure; a failed release is Failed; a dry-run
   // that could not say either way is Unverified; otherwise an armed
   // tx is Ready and a disarmed one is Disabled. `settled` marks a
-  // card whose body is collapsed and whose dry-run / edit buttons
-  // are disabled — a broadcasted, failed, or stale transaction.
+  // card whose body is collapsed and whose dry-run button is
+  // disabled — a broadcasted-and-confirmed, failed, or stale
+  // transaction (the Archived card). `pending` marks a card that is
+  // broadcast/submitted but not yet confirmed — the Pending card.
+  // A pending card takes the archived-card format (collapsed
+  // details, no arm toggle) but its Edit button stays available
+  // (label and notes only — the hex is locked) and a
+  // Slipstream-pending card carries a "Broadcast publicly" escape
+  // hatch. The route toggle is locked once broadcast: it appears
+  // only on Active cards.
   function txStatus(tx) {
     var dr = dryRunResults[tx.id] || null;
     if (tx.broadcasted || (tx.release && tx.release.status === 'broadcast')) {
-      if (tx.broadcasted && tx.broadcasted.found === false) return { label: 'Failed', cls: 'bad', settled: true };
-      return { label: 'Broadcasted', cls: 'ok', settled: true };
+      if (tx.broadcasted && tx.broadcasted.found === false) return { label: 'Failed', cls: 'bad', settled: true, pending: false };
+      // Confirmed (or a restore-carried 'broadcast' record with no
+      // broadcasted fact to consult) -> Archived, green. Broadcast
+      // but unconfirmed (0 confirmations, or not checked yet) ->
+      // Pending, amber.
+      if (!tx.broadcasted) return { label: 'Broadcasted', cls: 'ok', settled: true, pending: false };
+      var conf = tx.broadcasted.confirmations;
+      if ((typeof conf === 'number' && conf > 0) || tx.broadcasted.blockHeight != null) {
+        return { label: 'Broadcasted', cls: 'ok', settled: true, pending: false };
+      }
+      return { label: 'Broadcast', cls: 'warn', settled: false, pending: true };
     }
     if ((tx.release && tx.release.status === 'stale') || (dr && dr.spent)) {
-      return { label: 'Stale', cls: 'bad', settled: true };
+      return { label: 'Stale', cls: 'bad', settled: true, pending: false };
+    }
+    // Slipstream Pending (0.7.16): submitted to Slipstream, not yet
+    // visible in the public mempool. A pseudo-pending-but-success
+    // state — the card lives in the Pending Transactions card, with
+    // its own amber pill, distinct from Broadcasted and from Failed.
+    // It takes precedence over a timelock or conflict warning: the
+    // transaction is already submitted, so that is the state that
+    // matters.
+    if (tx.release && tx.release.status === 'submitted-slipstream') {
+      return { label: 'Slipstream Pending', cls: 'warn', settled: false, pending: true };
     }
     // Absolute-locktime warning (0.7.14): the transaction carries a
     // locktime that has not passed yet, so the node would reject it as
@@ -362,9 +452,9 @@
     // transaction once the locktime passes. Precedence matches the
     // dry-run: a timelock beats a conflict.
     if (dr && dr.verdict === 'timelocked') {
-      return { label: 'Timelocked', cls: 'warn', settled: false };
+      return { label: 'Timelocked', cls: 'warn', settled: false, pending: false };
     }
-    if (dr && dr.error) return { label: 'Node Failure', cls: 'warn', settled: false };
+    if (dr && dr.error) return { label: 'Node Failure', cls: 'warn', settled: false, pending: false };
     // Unconfirmed-spend warning (0.7.12, finding 1): another
     // transaction spends an input, but it is not confirmed yet and
     // may still be evicted — so the card stays active with a warning
@@ -372,18 +462,18 @@
     // server re-derives the warning on every fresh check: a clean
     // verdict clears it, a confirmed spend turns it stale.
     if ((tx.release && tx.release.status === 'conflict') || (dr && dr.verdict === 'conflict')) {
-      return { label: 'Conflict', cls: 'warn', settled: false };
+      return { label: 'Conflict', cls: 'warn', settled: false, pending: false };
     }
     if (tx.release && tx.release.status === 'failed') {
       var e = tx.release.error || '';
       var node = e.indexOf('input check failed') !== -1 || e.indexOf('could not reach') !== -1;
       return node
-        ? { label: 'Node Failure', cls: 'warn', settled: false }
-        : { label: 'Failed', cls: 'warn', settled: false };
+        ? { label: 'Node Failure', cls: 'warn', settled: false, pending: false }
+        : { label: 'Failed', cls: 'warn', settled: false, pending: false };
     }
-    if (dr && dr.unknown) return { label: 'Unverified', cls: 'muted', settled: false };
-    if (!tx.enabled) return { label: 'Disabled', cls: 'muted', settled: false };
-    return { label: 'Ready', cls: 'ok', settled: false };
+    if (dr && dr.unknown) return { label: 'Unverified', cls: 'muted', settled: false, pending: false };
+    if (!tx.enabled) return { label: 'Disabled', cls: 'muted', settled: false, pending: false };
+    return { label: 'Ready', cls: 'ok', settled: false, pending: false };
   }
 
   // 'f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16:1'
@@ -406,17 +496,17 @@
     // every load (the state carries the shared inputs, computed
     // server-side), so the warning persists across refreshes — it is
     // not page memory, and no Dry-run all is needed for it to appear.
-    // A settled card gets no warning: its fate is already decided.
-    // The detection itself still looks at every stored transaction,
-    // because a broadcasted one is exactly why another one sharing
-    // its input can never broadcast. Editing a transaction to spend
-    // a different input removes it from the shared set, and the
-    // warning clears on the next load.
+    // A settled or pending card gets no warning: its fate is already
+    // decided. The detection itself still looks at every stored
+    // transaction, because a broadcasted one is exactly why another
+    // one sharing its input can never be confirmed. Editing a
+    // transaction to spend a different input removes it from the
+    // shared set, and the warning clears on the next load.
     var overlapsByTx = {};
     (S.bitcoin.overlaps || []).forEach(function (ov) {
       ov.txIds.forEach(function (tid) {
         var tx = (S.bitcoin.txs || []).find(function (y) { return y.id === tid; });
-        if (tx && txStatus(tx).settled) return;
+        if (tx && (txStatus(tx).settled || txStatus(tx).pending)) return;
         var others = ov.txIds.filter(function (x) { return x !== tid; }).map(function (x) {
           var t = (S.bitcoin.txs || []).find(function (y) { return y.id === x; });
           return t ? ('"' + (t.label || 'Untitled transaction') + '"') : x;
@@ -424,25 +514,35 @@
         (overlapsByTx[tid] = overlapsByTx[tid] || []).push({ input: ov.input, others: others });
       });
     });
-    // The two lists: the ones still waiting live inside the
+    // The three lists: the ones still waiting live inside the
     // Pre-signed Bitcoin transactions card, below the Dry-run All /
-    // Broadcast All buttons; the settled ones (broadcasted or stale)
-    // live in the Archived Transactions card.
+    // Broadcast All buttons; the ones broadcast or submitted but not
+    // yet confirmed live in the Pending Transactions card; the
+    // settled ones (broadcasted-and-confirmed, or stale) live in the
+    // Archived Transactions card.
     var activeList = $('btc-active-list');
+    var pendingList = $('btc-pending-list');
     var archivedList = $('btc-archived-list');
     activeList.innerHTML = '';
+    pendingList.innerHTML = '';
     archivedList.innerHTML = '';
     txCardEls = {};
     // Newest first. The sort is render-time only: the release still
-    // evaluates stored transactions in stored order.
+    // evaluates stored transactions in stored order. Active first,
+    // then pending, then archived.
+    function bucketRank(t) {
+      var st = txStatus(t);
+      return st.settled ? 2 : (st.pending ? 1 : 0);
+    }
     var sorted = txs.slice().reverse().sort(function (a, b) {
-      return (txStatus(a).settled ? 1 : 0) - (txStatus(b).settled ? 1 : 0);
+      return bucketRank(a) - bucketRank(b);
     });
     sorted.forEach(function (tx) {
       var row = document.createElement('div');
       row.className = 'tx-card tx-sub';
       var st = txStatus(tx);
       var settled = st.settled;
+      var pending = st.pending;
       // The status pill lives in the label row, top-right. The label
       // takes the space that is left and wraps inside it, so it can
       // never run over the pill — and the pill is in the same spot
@@ -455,14 +555,29 @@
       txid.className = 'txid';
       txid.textContent = tx.txid.slice(0, 16) + '…';
       var pill = document.createElement('span');
-      pill.className = 'pill ' + st.cls;
+      // A warned-about tx keeps its "Ready" label but gets an amber
+      // pill (0.7.16 amendment, Ryan): the tx is still ready to
+      // broadcast, but the warning — a shared input, only one of
+      // them can ever be confirmed — deserves attention. Only the
+      // green pill changes: Conflict/Timelocked/Node Failure are
+      // already amber, and settled/pending cards never carry a
+      // warning line (overlapsByTx skips them), so 'ok' + a warning
+      // can only be a Ready card.
+      var pillCls = st.cls;
+      if (pillCls === 'ok' && overlapsByTx[tx.id] && overlapsByTx[tx.id].length) pillCls = 'warn';
+      pill.className = 'pill ' + pillCls;
       pill.textContent = st.label;
       head.appendChild(title); head.appendChild(txid); head.appendChild(pill);
       row.appendChild(head);
       // The arm/disarm toggle is always its own row below the label
       // — never sharing the label row. It is gone entirely on a
-      // settled card (broadcasted or stale).
-      if (!settled) {
+      // pending or settled card (broadcasted or stale): the tx is
+      // already out the door, so there is nothing to arm. The
+      // broadcast-route toggle goes with it — the route, like the
+      // hex, is locked once the tx is out the door (0.7.16). If the
+      // tx drops back to 'release-due' it becomes Active again and
+      // both toggles come back.
+      if (!settled && !pending) {
         var armRow = document.createElement('div');
         armRow.className = 'tx-arm';
         var tog = document.createElement('label');
@@ -478,12 +593,41 @@
         tog.appendChild(cb); tog.appendChild(slider); tog.appendChild(state);
         armRow.appendChild(tog);
         row.appendChild(armRow);
+        // The broadcast route (0.7.16): which network this
+        // transaction goes out on. A label, not a control — the
+        // route is changed in the Edit popup, not on the card
+        // (0.7.17 follow-up: the card toggle is gone). Only the
+        // selected route is attempted, and switching it applies
+        // to the next broadcast attempt. It sits below the arm
+        // toggle, on active cards only — the route is locked
+        // once the tx is out the door.
+        var routeRow = document.createElement('div');
+        routeRow.className = 'tx-route';
+        routeRow.textContent = 'Broadcast via: ' + (tx.broadcastVia === 'slipstream' ? 'Slipstream (MARA)' : 'Public mempool');
+        row.appendChild(routeRow);
+        // The public fallback (0.7.17): a per-transaction opt-in
+        // timer, shown only while the route is Slipstream — when the
+        // route is public the setting is stored but ignored, and the
+        // row hides (it comes back if the route is switched back to
+        // Slipstream in the Edit popup). A label, not a control —
+        // the duration is changed in the Edit popup, not on the
+        // card (0.7.17 follow-up: the card select is gone).
+        if (tx.broadcastVia === 'slipstream') {
+          var fbRow = document.createElement('div');
+          fbRow.className = 'tx-fallback';
+          fbRow.textContent = 'Public Fallback: ' + fallbackLabel(tx.publicFallbackDays);
+          row.appendChild(fbRow);
+        }
       }
-      // A settled transaction hides everything but its label and
-      // status into a collapsible, collapsed by default. The action
-      // buttons stay outside it — with dry-run and edit disabled.
+      // A settled or pending transaction hides everything but its
+      // label and status into a collapsible, collapsed by default
+      // (the Pending card takes the archived-card format). The
+      // action buttons stay outside it — with dry-run disabled, and
+      // Broadcast Now disabled too (the tx is already out the door).
+      // Edit stays available on both (label and notes only — the
+      // hex field is disabled in edit mode for these).
       var details = null, body = row;
-      if (settled) {
+      if (settled || pending) {
         details = document.createElement('details');
         details.className = 'tx-details';
         var sum = document.createElement('summary');
@@ -510,38 +654,103 @@
         body.appendChild(rel);
         if (tx.broadcasted) sentLine = rel;
       }
+      // The public fallback on a Slipstream-pending card (0.7.17):
+      // a plain-text line — the duration and the countdown to the
+      // deadline, side by side. The duration is changed in the
+      // Edit popup, not on the card (0.7.17 follow-up: the card
+      // select is gone, and with it the tooltip and the note that
+      // used to sit under it — the deadline warning now lives in
+      // the Edit popup only). Changing the duration only moves the
+      // deadline: it is counted from when MARA first received the
+      // transaction, and setting it sooner or later does not change
+      // the count. It does not re-send anything.
+      if (pending && tx.release && tx.release.status === 'submitted-slipstream') {
+        var fbRowP = document.createElement('div');
+        fbRowP.className = 'tx-fallback';
+        fbRowP.textContent = 'Public Fallback: ' + fallbackLabel(tx.publicFallbackDays) + ' ' + fallbackCountdown(tx);
+        body.appendChild(fbRowP);
+      }
       var actions = document.createElement('div');
       actions.className = 'tx-actions';
       var dryBtn = document.createElement('button');
       dryBtn.textContent = 'Dry-run';
-      dryBtn.disabled = settled;
-      if (settled) dryBtn.title = 'Transaction already broadcast or spent';
+      dryBtn.disabled = settled || pending;
+      if (settled || pending) dryBtn.title = 'Transaction already broadcast or submitted';
       dryBtn.addEventListener('click', function () { dryRunTx(tx.id); });
+      // Edit stays available on every card — including Pending and
+      // Archived ones — but for those it may change only the label
+      // and notes: the hex field is disabled in edit mode (and the
+      // server rejects a hex change on a broadcasted or
+      // Slipstream-pending tx). See startEdit.
       var editBtn = document.createElement('button');
       editBtn.textContent = 'Edit';
-      editBtn.disabled = settled;
-      if (settled) editBtn.title = 'Transaction already broadcast or spent';
       editBtn.addEventListener('click', function () { startEdit(tx); });
       var delBtn = document.createElement('button');
       delBtn.textContent = 'Delete';
       delBtn.className = 'danger';
       delBtn.addEventListener('click', function () {
+        // The confirm must say what deleting actually does. For an
+        // Active tx it stops a future broadcast — but a tx already
+        // out the door cannot be recalled: deleting it only removes
+        // Standby's record of it, and it can still confirm on the
+        // network. Branched on the same txStatus() classification
+        // the card itself uses (st is in scope here).
+        var label = tx.label || 'Untitled transaction';
+        var delBody;
+        if (tx.release && tx.release.status === 'submitted-slipstream') {
+          delBody = 'This deletes "' + label + '" from Standby. It has already been submitted to MARA Slipstream and is waiting to be mined — deleting it here does NOT cancel or recall it, and MARA can still mine it. Its history on this card goes with it.';
+        } else if (tx.broadcasted) {
+          var conf = tx.broadcasted.confirmations;
+          if (tx.broadcasted.found === false) {
+            delBody = 'This deletes "' + label + '" from Standby. It was already broadcast, but the network no longer reports it — deleting it here only removes it from Standby; it does not undo the broadcast. Its history on this card goes with it.';
+          } else if ((typeof conf === 'number' && conf > 0) || tx.broadcasted.blockHeight != null) {
+            delBody = 'This deletes "' + label + '" from Standby. It has already been broadcast and confirmed on the network — deleting it here does NOT undo the broadcast. Its history on this card goes with it.';
+          } else {
+            delBody = 'This deletes "' + label + '" from Standby. It is already in the public mempool waiting for its first confirmation — deleting it here does NOT stop or recall it, and it can still confirm on the network. Its history on this card goes with it.';
+          }
+        } else if (st.label === 'Stale') {
+          delBody = 'This deletes "' + label + '" from Standby. Its inputs were spent, so it will never broadcast — deleting it here only removes the record from Standby. Its history on this card goes with it.';
+        } else if (st.label === 'Broadcasted') {
+          // A restore-carried 'broadcast' record with no broadcasted
+          // fact to consult: it was broadcast, but we cannot say
+          // whether it has confirmed yet.
+          delBody = 'This deletes "' + label + '" from Standby. It has already been broadcast — deleting it here only removes it from Standby; it does not undo the broadcast. Its history on this card goes with it.';
+        } else {
+          delBody = 'This deletes "' + label + '" from Standby. It will no longer be broadcast if the release runs, and its history on this card goes with it.';
+        }
         showConfirm('Delete this transaction?',
-          'This deletes "' + (tx.label || 'Untitled transaction') + '" from Standby. It will no longer be broadcast if the release runs, and its history on this card goes with it.',
+          delBody,
           function () { deleteTx(tx.id); },
           'Delete');
       });
       // Broadcast Now: send this transaction immediately, on the owner's
       // say-so — same path as the release, after a confirmation dialog.
-      // A sent or stale transaction cannot be broadcast from its card.
+      // A sent or stale transaction cannot be broadcast from its card,
+      // and neither can one already submitted to Slipstream — it is
+      // waiting on MARA, and re-submitting it would be a duplicate.
+      // A pending public tx is already out the door too.
       var bcBtn = document.createElement('button');
       bcBtn.textContent = 'Broadcast Now';
       bcBtn.className = 'danger';
-      bcBtn.disabled = settled;
+      var waitingMara = !!(tx.release && tx.release.status === 'submitted-slipstream');
+      bcBtn.disabled = settled || pending || waitingMara;
       if (tx.broadcasted) bcBtn.title = 'Already broadcast';
+      else if (waitingMara) bcBtn.title = 'Already submitted to Slipstream — waiting on MARA';
       else if (settled) bcBtn.title = 'Stale — inputs spent';
       else bcBtn.addEventListener('click', function () { broadcastNow(tx.id); });
       actions.appendChild(dryBtn); actions.appendChild(editBtn); actions.appendChild(delBtn); actions.appendChild(bcBtn);
+      // The escape hatch for a slow MARA tx (0.7.16, Pending card):
+      // a Slipstream-pending tx can be broadcast publicly instead,
+      // by hand. It is NOT part of Broadcast All or the release —
+      // only this button, after a confirmation that names the
+      // privacy cost (the tx becomes visible in the public mempool).
+      if (waitingMara) {
+        var pubBtn = document.createElement('button');
+        pubBtn.textContent = 'Broadcast publicly';
+        pubBtn.className = 'danger';
+        pubBtn.addEventListener('click', function () { broadcastPublic(tx.id); });
+        actions.appendChild(pubBtn);
+      }
       row.appendChild(actions);
       // The last dry-run result for THIS transaction, rendered in its own
       // card — not in the add-transaction card below. The line itself is
@@ -563,19 +772,19 @@
       }
       // Shared-input warnings from the state (see renderBitcoin):
       // this tx spends an input another stored tx also spends, so
-      // only one of them can ever broadcast. The input is shown
+      // only one of them can ever be confirmed. The input is shown
       // short so the line cannot overflow the card.
       var ow = overlapsByTx[tx.id];
       if (ow && ow.length) {
         ow.forEach(function (w) {
           var warnLine = document.createElement('p');
           warnLine.className = 'tx-warn';
-          warnLine.textContent = 'Warning: shares input ' + shortInput(w.input) + ' with ' + w.others + ' — only one of them can ever broadcast.';
+          warnLine.textContent = 'Warning: shares input ' + shortInput(w.input) + ' with ' + w.others + ' — only one of them can ever be confirmed.';
           body.appendChild(warnLine);
         });
       }
       txCardEls[tx.id] = { row: row, sentLine: sentLine, pill: pill };
-      (settled ? archivedList : activeList).appendChild(row);
+      (settled ? archivedList : (pending ? pendingList : activeList)).appendChild(row);
     });
     // A list with nothing in it yet says so, instead of sitting empty.
     if (!activeList.children.length) {
@@ -583,6 +792,12 @@
       noneActive.className = 'muted';
       noneActive.textContent = 'No active transactions — add one below.';
       activeList.appendChild(noneActive);
+    }
+    if (!pendingList.children.length) {
+      var nonePending = document.createElement('p');
+      nonePending.className = 'muted';
+      nonePending.textContent = 'No pending transactions yet.';
+      pendingList.appendChild(nonePending);
     }
     if (!archivedList.children.length) {
       var noneArchived = document.createElement('p');
@@ -600,46 +815,69 @@
     } catch (e) { setMsg($('btc-msg'), e.message, false); await load(); }
   }
 
-  // The ids of the transactions that are settled right now (broadcasted
-  // or stale) — the ones already in the Archived Transactions card.
-  function settledIds() {
+  // The ids of the transactions that are NOT active right now
+  // (pending or archived) — the ones no longer in the Active list.
+  // Used to detect, after a dry-run, which transactions just left
+  // the Active list.
+  function inactiveIds() {
     var ids = {};
     (S.bitcoin.txs || []).forEach(function (t) {
-      if (txStatus(t).settled) ids[t.id] = true;
+      var st = txStatus(t);
+      if (st.settled || st.pending) ids[t.id] = true;
     });
     return ids;
   }
-  // After a dry-run, pop up the transactions that just moved to the
-  // Archived Transactions card — one line each, naming the transaction
-  // and the reason (its inputs are spent). Only the ones that moved in
-  // this run; if none moved, no pop-up. The broadcast cases do not
-  // need one: Broadcast All already lists each transaction and its
-  // outcome, and Broadcast Now shows the sent line on the card.
+  // After a dry-run, pop up the transactions that just left the
+  // Active list — one line each, naming the transaction and the
+  // reason (its inputs are spent, or it is already out there). Only
+  // the ones that moved in this run; if none moved, no pop-up. The
+  // broadcast cases do not need one: Broadcast All already lists
+  // each transaction and its outcome, and Broadcast Now shows the
+  // sent line on the card. A move can land in the Pending
+  // Transactions card (a dry-run discovering the tx is already out
+  // there, unconfirmed) or the Archived Transactions card (inputs
+  // spent, or already out there and confirmed) — the pop-up names
+  // the destination it actually landed in, and opens that card so
+  // the move is visible the moment the pop-up closes.
   function noticeMovedToArchive(before, moved, why) {
     var fresh = (moved || []).filter(function (m) { return !before[m.id]; });
     if (!fresh.length) return;
-    // The moved card lands in the Archived Transactions card, which
-    // is collapsed by default — open it, so the move is visible the
-    // moment the pop-up closes instead of needing a refresh (and a
-    // hunt for the collapsed section) to see it.
-    var archived = $('archived-card');
-    if (archived) archived.open = true;
-    var n = fresh.length;
     // `why` is 'broadcast' when the move is a dry-run discovering
     // the transaction is already out there (0.7.12, finding 1) —
     // the wording must not say its inputs are spent.
     var broadcast = why === 'broadcast';
-    showDetails('Moved to Archived Transactions',
-      n + ' transaction' + (n === 1 ? '' : 's') + ' moved to Archived Transactions — ' + (broadcast
-        ? 'already out there (the network reports its own txid), so recorded as broadcast.'
-        : (n === 1 ? 'its' : 'their') + ' inputs are spent.'),
+    var pend = [], arch = [];
+    fresh.forEach(function (m) {
+      var tx = (S.bitcoin.txs || []).find(function (t) { return t.id === m.id; });
+      var st = tx ? txStatus(tx) : null;
+      if (st && st.pending) pend.push(m);
+      else arch.push(m);
+    });
+    if (!pend.length && !arch.length) return;
+    var pendingCard = $('pending-card');
+    if (pendingCard && pend.length) pendingCard.open = true;
+    var archived = $('archived-card');
+    if (archived && arch.length) archived.open = true;
+    var title = pend.length && arch.length ? 'Transactions moved'
+      : pend.length ? 'Moved to Pending Transactions'
+      : 'Moved to Archived Transactions';
+    var parts = [];
+    if (pend.length) parts.push(pend.length + ' transaction' + (pend.length === 1 ? '' : 's') + ' moved to Pending Transactions — ' + (broadcast
+      ? 'already out there (the network reports its own txid), so recorded as broadcast, waiting for its first confirmation.'
+      : (pend.length === 1 ? 'its' : 'their') + ' inputs are spent.'));
+    if (arch.length) parts.push(arch.length + ' transaction' + (arch.length === 1 ? '' : 's') + ' moved to Archived Transactions — ' + (broadcast
+      ? 'already out there (the network reports its own txid), so recorded as broadcast.'
+      : (arch.length === 1 ? 'its' : 'their') + ' inputs are spent.'));
+    showDetails(title, parts.join(' '),
       '<ul class="plain-list">' + fresh.map(function (m) {
-        return '<li>' + escapeHtml(m.label || 'Untitled transaction') + ' — ' + (broadcast ? 'already broadcast' : 'inputs spent') + '</li>';
+        var tx = (S.bitcoin.txs || []).find(function (t) { return t.id === m.id; });
+        var dest = tx && txStatus(tx).pending ? 'pending' : 'archived';
+        return '<li>' + escapeHtml(m.label || 'Untitled transaction') + ' — ' + (broadcast ? 'already broadcast' : 'inputs spent') + ' (' + dest + ')</li>';
       }).join('') + '</ul>');
   }
 
   async function dryRunTx(id) {
-    var before = settledIds();
+    var before = inactiveIds();
     try {
       var r = await api('POST', '/api/broadcast/test', { id: id });
       var one = (r.results || [])[0] || {};
@@ -661,26 +899,125 @@
     }
   }
 
+  // A transaction is locked once it is out the door — broadcasted,
+  // or submitted to Slipstream and waiting on MARA. Its hex (and
+  // its route) cannot change; only the label and notes can.
+  function isTxLocked(tx) {
+    var st = txStatus(tx);
+    return st.settled || st.pending;
+  }
+
+  // Edit in a popup (0.7.16 amendment): editing used to hijack the
+  // Add-transaction card at the bottom of the tab, which scrolled
+  // the page all the way down on a phone. The popup carries the
+  // same fields; the Add card stays "Add" only and never switches
+  // to edit mode. editingId is the single source of truth for "an
+  // edit is open" — the popup's Save button keys off it.
   function startEdit(tx) {
     editingId = tx.id;
-    $('btc-label').value = tx.label || '';
-    $('btc-notes').value = tx.notes || '';
-    $('btc-hex').value = tx.hex || '';
-    $('btc-form-title').textContent = 'Edit transaction';
-    $('btn-btc-add').textContent = 'Save changes';
-    $('btn-btc-cancel-edit').style.display = '';
-    $('btc-label').focus();
+    $('edit-label').value = tx.label || '';
+    $('edit-notes').value = tx.notes || '';
+    $('edit-hex').value = tx.hex || '';
+    // The route selector follows the transaction being edited, so
+    // saving keeps its route unless the owner changes it.
+    $('edit-route').value = tx.broadcastVia === 'slipstream' ? 'slipstream' : 'public';
+    // The fallback select (0.7.17): it follows the transaction's
+    // route — shown for Active and Pending txs while the route is
+    // Slipstream, hidden for settled/archived txs (it is meaningless
+    // there) and while the route is public. Changing the route in
+    // the popup toggles the row (see the edit-route listener below).
+    // A Pending tx's title names the fallback too: its hex and route
+    // are locked, but the label, notes, and fallback can change.
+    $('edit-fallback').value = (tx.publicFallbackDays === null || tx.publicFallbackDays === undefined) ? '' : String(tx.publicFallbackDays);
+    var stEdit = txStatus(tx);
+    $('edit-fallback-row').style.display = (!stEdit.settled && tx.broadcastVia === 'slipstream') ? '' : 'none';
+    // The deadline warning (0.7.17 follow-up): it lives ONLY in
+    // the Edit popup, and ONLY for a Pending tx — the deadline is
+    // already running there, counted from when MARA first received
+    // the transaction. An Active tx has no deadline yet, and a
+    // settled tx has no fallback at all, so neither shows it.
+    $('edit-fallback-note').style.display = (stEdit.pending && tx.broadcastVia === 'slipstream') ? '' : 'none';
+    // A locked tx (Pending or Archived) may change only its label
+    // and notes: the hex box, the route selector and the Import
+    // button are disabled (import would only populate a hex that
+    // cannot change), and a note says so. The server enforces the
+    // same rule (PUT rejects a hex change on a locked tx).
+    var locked = isTxLocked(tx);
+    $('edit-hex').disabled = locked;
+    $('edit-hex').title = locked ? 'The transaction hex cannot be changed once it has been broadcast' : '';
+    $('edit-route').disabled = locked;
+    $('edit-route').title = locked ? 'The broadcast route is locked once the transaction is out the door' : '';
+    $('btn-edit-import-file').disabled = locked;
+    $('edit-locked-note').style.display = locked ? '' : 'none';
+    $('edit-form-title').textContent = !locked ? 'Edit transaction'
+      : stEdit.settled ? 'Edit transaction — label and notes only'
+      : 'Edit transaction — label, notes and fallback only';
+    $('edit-msg').textContent = '';
+    $('edit-modal').classList.add('open');
+    $('edit-label').focus();
   }
 
   function cancelEdit() {
     editingId = null;
-    $('btc-label').value = '';
-    $('btc-notes').value = '';
-    $('btc-hex').value = '';
-    $('btc-form-title').textContent = 'Add a transaction';
-    $('btn-btc-add').textContent = '+ Add transaction';
-    $('btn-btc-cancel-edit').style.display = 'none';
+    $('edit-label').value = '';
+    $('edit-notes').value = '';
+    $('edit-hex').value = '';
+    $('edit-route').value = 'public';
+    $('edit-fallback').value = '';
+    $('edit-fallback-row').style.display = 'none';
+    $('edit-fallback-note').style.display = 'none';
+    // Re-enable the fields a locked edit disabled.
+    $('edit-hex').disabled = false;
+    $('edit-hex').title = '';
+    $('edit-route').disabled = false;
+    $('edit-route').title = '';
+    $('btn-edit-import-file').disabled = false;
+    $('edit-locked-note').style.display = 'none';
+    $('edit-form-title').textContent = 'Edit transaction';
+    $('edit-msg').textContent = '';
+    $('edit-modal').classList.remove('open');
   }
+
+  // The edit popup closes like the confirm modal: Cancel, the X,
+  // or a click on the backdrop. Guarded like modal-x: a mixed tree
+  // (new script, old page) must degrade to a missing X, not a dead
+  // page.
+  $('btn-edit-cancel').addEventListener('click', function () { cancelEdit(); });
+  // The edit popup's fallback row follows the route selector
+  // (0.7.17): it shows while the route is Slipstream and hides
+  // while it is public — the same rule as the Add form and the card.
+  $('edit-route').addEventListener('change', function () {
+    $('edit-fallback-row').style.display = $('edit-route').value === 'slipstream' ? '' : 'none';
+  });
+  var editModalX = $('edit-modal-x');
+  if (editModalX) editModalX.addEventListener('click', function () { cancelEdit(); });
+  $('edit-modal').addEventListener('click', function (e) {
+    if (e.target === $('edit-modal')) cancelEdit();
+  });
+
+  // Save the open edit: the PUT the Add button used to do. Errors
+  // stay in the popup (edit-msg) so the owner can fix them; on
+  // success the popup closes and the message lands on the Add
+  // card, which is visible after the popup closes.
+  $('btn-edit-save').addEventListener('click', async function () {
+    if (!editingId) return;
+    var hex = $('edit-hex').value.trim();
+    if (!hex) { setMsg($('edit-msg'), 'Paste the signed transaction hex first.', false); return; }
+    try {
+      await saveBitcoinSettings();
+      var oldTx = (S.bitcoin.txs || []).find(function (t) { return t.id === editingId; });
+      var editFbVal = $('edit-fallback').value;
+      var body = { txHex: hex, label: $('edit-label').value, notes: $('edit-notes').value, broadcastVia: $('edit-route').value, publicFallbackDays: editFbVal === '' ? null : parseInt(editFbVal, 10) };
+      var r = await api('PUT', '/api/bitcoin/txs/' + encodeURIComponent(editingId), body);
+      // A replaced hex makes the old dry-run result stale (the
+      // shared-input warning clears on its own — the server
+      // recomputes it from the new hexes on the next load).
+      if (oldTx && oldTx.hex !== hex) { delete dryRunResults[editingId]; }
+      setMsg($('btc-msg'), 'Transaction updated. TXID ' + r.tx.txid + '.', true);
+      cancelEdit();
+      await load();
+    } catch (e) { setMsg($('edit-msg'), e.message, false); }
+  });
 
   async function deleteTx(id) {
     try {
@@ -717,40 +1054,56 @@
     } catch (e) { setMsg($('btc-nodes-msg'), e.message, false); }
   });
 
+  // The Add form's fallback row (0.7.17): shown only while the route
+  // is Slipstream — when the route is public the setting is stored
+  // but ignored, and the row hides. The note under the select says
+  // what the chosen duration means.
+  function syncAddFallbackRow() {
+    var slip = $('btc-route').value === 'slipstream';
+    $('btc-fallback-row').style.display = slip ? '' : 'none';
+    if (slip) {
+      var v = $('btc-fallback').value;
+      $('btc-fallback-note').textContent = fallbackAddNote(v === '' ? null : parseInt(v, 10));
+    }
+  }
+  $('btc-route').addEventListener('change', syncAddFallbackRow);
+  $('btc-fallback').addEventListener('change', syncAddFallbackRow);
+
+  // The Add card is add-only now (0.7.16 amendment): editing lives
+  // in the popup, so this button always POSTs a new transaction.
+  // After a successful add the form clears, ready for the next one.
   $('btn-btc-add').addEventListener('click', async function () {
     var hex = $('btc-hex').value.trim();
     if (!hex) { setMsg($('btc-msg'), 'Paste the signed transaction hex first.', false); return; }
     try {
       await saveBitcoinSettings();
-      var body = { txHex: hex, label: $('btc-label').value, notes: $('btc-notes').value };
-      var r;
-      if (editingId) {
-        var oldTx = (S.bitcoin.txs || []).find(function (t) { return t.id === editingId; });
-        r = await api('PUT', '/api/bitcoin/txs/' + encodeURIComponent(editingId), body);
-        // A replaced hex makes the old dry-run result stale (the
-        // shared-input warning clears on its own — the server
-        // recomputes it from the new hexes on the next load).
-        if (oldTx && oldTx.hex !== hex) { delete dryRunResults[editingId]; }
-        setMsg($('btc-msg'), 'Transaction updated. TXID ' + r.tx.txid + '.', true);
-      } else {
-        r = await api('POST', '/api/bitcoin/txs', body);
-        setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to disarm it.', true);
-      }
-      cancelEdit();
+      var fbVal = $('btc-fallback').value;
+      var body = { txHex: hex, label: $('btc-label').value, notes: $('btc-notes').value, broadcastVia: $('btc-route').value, publicFallbackDays: fbVal === '' ? null : parseInt(fbVal, 10) };
+      var r = await api('POST', '/api/bitcoin/txs', body);
+      setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to disarm it.', true);
+      $('btc-label').value = '';
+      $('btc-notes').value = '';
+      $('btc-hex').value = '';
+      $('btc-route').value = 'public';
+      $('btc-fallback').value = '';
+      syncAddFallbackRow();
       await load();
     } catch (e) { setMsg($('btc-msg'), e.message, false); }
   });
 
-  $('btn-btc-cancel-edit').addEventListener('click', function () { cancelEdit(); });
-
   // Import a signed transaction from a file: the file's hex is put
   // in the "Signed transaction" box — it does NOT add the
   // transaction. The user adds a label/note in the fields and clicks
-  // "+ Add transaction" (the normal paste path) to add it. A hex file
-  // goes straight in the box; a PSBT file is finalized server-side
-  // (preview endpoint) first and the extracted raw hex goes in the
-  // box. A PSBT that is not fully signed is rejected by the server
-  // with the inputs named, and the box is left alone.
+  // "+ Add transaction" (the normal paste path) to add it, or Save
+  // changes in the edit popup. A hex file goes straight in the box;
+  // a PSBT file is finalized server-side (preview endpoint) first
+  // and the extracted raw hex goes in the box. A PSBT that is not
+  // fully signed is rejected by the server with the inputs named,
+  // and the box is left alone. Shared by the Add card (btc-*) and
+  // the edit popup (edit-*) — hexId/msgId/fileId name the targets.
+  // A successful import just fills the hex box; there is no success
+  // message (the filled box is the confirmation). Errors still
+  // report through msgId.
   function base64OfBytes(bytes) {
     var bin = '';
     var chunk = 0x8000;
@@ -759,9 +1112,7 @@
     }
     return btoa(bin);
   }
-  $('btn-btc-import-file').addEventListener('click', function () { $('btc-file').click(); });
-  $('btc-file').addEventListener('change', function () {
-    var file = $('btc-file').files && $('btc-file').files[0];
+  function importTxFile(file, hexId, msgId, fileId) {
     if (!file) return;
     var reader = new FileReader();
     reader.onload = async function () {
@@ -770,15 +1121,13 @@
         var text = new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim();
         if (/^[0-9a-fA-F]+$/.test(text) && text.length > 0 && text.length % 2 === 0) {
           // Hex file: put the hex straight in the box.
-          $('btc-hex').value = text;
-          setMsg($('btc-msg'), 'Hex loaded from file — add a label, then Add transaction.', true);
+          $(hexId).value = text;
         } else if (bytes.length >= 5 && bytes[0] === 0x70 && bytes[1] === 0x73 && bytes[2] === 0x62 && bytes[3] === 0x74 && bytes[4] === 0xff) {
           // Raw binary PSBT: finalize it server-side, then put the
           // extracted hex in the box. Base64-encoded here so it
           // survives the JSON body.
           var r = await api('POST', '/api/bitcoin/txs/preview', { format: 'psbt', data: base64OfBytes(bytes) });
-          $('btc-hex').value = r.hex;
-          setMsg($('btc-msg'), 'PSBT loaded from file — add a label, then Add transaction.', true);
+          $(hexId).value = r.hex;
         } else {
           // Base64 PSBT text: finalize it server-side the same way.
           var b64 = text.replace(/\s+/g, '');
@@ -788,19 +1137,26 @@
           }
           if (decodesToPsbt) {
             var r2 = await api('POST', '/api/bitcoin/txs/preview', { format: 'psbt', data: text });
-            $('btc-hex').value = r2.hex;
-            setMsg($('btc-msg'), 'PSBT loaded from file — add a label, then Add transaction.', true);
+            $(hexId).value = r2.hex;
           } else {
             // Neither hex nor a PSBT — say so plainly instead of
             // sending it as a PSBT and getting a PSBT error back.
-            setMsg($('btc-msg'), 'This file does not look like a signed transaction. Import a plain hex file or a fully-signed PSBT (.psbt).', false);
+            setMsg($(msgId), 'This file does not look like a signed transaction. Import a plain hex file or a fully-signed PSBT (.psbt).', false);
           }
         }
-      } catch (e) { setMsg($('btc-msg'), e.message, false); }
-      $('btc-file').value = '';
+      } catch (e) { setMsg($(msgId), e.message, false); }
+      $(fileId).value = '';
     };
-    reader.onerror = function () { setMsg($('btc-msg'), 'Could not read that file.', false); $('btc-file').value = ''; };
+    reader.onerror = function () { setMsg($(msgId), 'Could not read that file.', false); $(fileId).value = ''; };
     reader.readAsArrayBuffer(file);
+  }
+  $('btn-btc-import-file').addEventListener('click', function () { $('btc-file').click(); });
+  $('btc-file').addEventListener('change', function () {
+    importTxFile($('btc-file').files && $('btc-file').files[0], 'btc-hex', 'btc-msg', 'btc-file');
+  });
+  $('btn-edit-import-file').addEventListener('click', function () { $('edit-file').click(); });
+  $('edit-file').addEventListener('change', function () {
+    importTxFile($('edit-file').files && $('edit-file').files[0], 'edit-hex', 'edit-msg', 'edit-file');
   });
 
   // The modal does double duty: a confirmation dialog (Broadcast Now,
@@ -924,22 +1280,52 @@
       'Broadcast — I understand');
   }
 
-  // Broadcast All: the transactions NOT in the Archived Transactions
-  // card (broadcasted or stale), each through the same path. The
-  // dialog names the count — and once the owner proceeds, a status
-  // pop-out says what is being attempted and then what completed,
-  // one line per transaction, so a mixed result (one broadcast, one
-  // stale) is legible instead of a single aggregate line. The pop-out
-  // stays open until the owner closes it; closing it mid-run leaves
-  // it closed and lets the aggregate line below the buttons speak.
-  // The archived ones are never attempted or counted: their ids are
-  // not sent, and the server skips them too.
+  // The manual escape hatch for a slow MARA tx (0.7.16, Pending
+  // card): broadcast a Slipstream-pending transaction publicly
+  // instead. MANUAL ONLY — it is not part of Broadcast All or the
+  // release. The confirm names the privacy cost: the tx is
+  // currently private in MARA's mempool, and broadcasting it
+  // publicly puts it in the public mempool, visible to everyone.
+  // On success the tx becomes public-pending (and follows the
+  // normal path from there: confirmed -> Archived). On failure the
+  // error is surfaced and the tx stays Slipstream-pending.
+  async function broadcastPublic(id) {
+    var tx = (S.bitcoin.txs || []).find(function (t) { return t.id === id; });
+    if (!tx || !(tx.release && tx.release.status === 'submitted-slipstream')) return;
+    var label = tx.label || 'Untitled transaction';
+    showConfirm('Broadcast this transaction publicly?',
+      'This will broadcast "' + label + '" to the PUBLIC mempool for real — the funds move and it cannot be undone. It is currently waiting on MARA Slipstream, where it stays private until MARA mines it. Broadcasting publicly makes it visible to everyone in the public mempool — it gives up the Slipstream privacy. The inputs are re-checked first (a stale transaction is not sent), then it broadcasts via the primary node, falling back to the secondary if the primary does not answer.',
+      async function () {
+        try {
+          var r = await api('POST', '/api/bitcoin/txs/' + encodeURIComponent(id) + '/broadcast-public', {});
+          setMsg($('btc-all-msg'), broadcastResultText(r), r.action === 'broadcast');
+          await load();
+          await refreshConfirmations();
+        } catch (e) { setMsg($('btc-all-msg'), e.message, false); }
+      },
+      'Broadcast publicly — I understand');
+  }
+
+  // Broadcast All: the transactions NOT in the Archived or Pending
+  // Transactions cards (broadcasted, stale, or still waiting for a
+  // confirmation), each through the same path. The dialog names the
+  // count — and once the owner proceeds, a status pop-out says what
+  // is being attempted and then what completed, one line per
+  // transaction, so a mixed result (one broadcast, one stale) is
+  // legible instead of a single aggregate line. The pop-out stays
+  // open until the owner closes it; closing it mid-run leaves it
+  // closed and lets the aggregate line below the buttons speak.
+  // The archived and pending ones are never attempted or counted:
+  // their ids are not sent, and the server skips them too. A
+  // Slipstream-pending tx is never broadcast publicly by Broadcast
+  // All — the public escape hatch is a separate manual button on
+  // its card.
   async function broadcastAll() {
-    var pending = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled; });
+    var pending = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
     if (!pending.length) {
       setMsg($('btc-all-msg'),
         (S.bitcoin.txs || []).length
-          ? 'Nothing to broadcast — every transaction is already archived.'
+          ? 'Nothing to broadcast — every transaction is already archived or pending.'
           : 'Nothing to broadcast — no transactions stored.',
         true);
       return;
@@ -980,7 +1366,7 @@
   $('btn-btc-broadcast-all').addEventListener('click', broadcastAll);
 
   $('btn-btc-test-all').addEventListener('click', async function () {
-    var before = settledIds();
+    var before = inactiveIds();
     try {
       var r = await api('POST', '/api/broadcast/test', {});
       // Each transaction's own result goes in its own card; the line
@@ -1023,27 +1409,38 @@
     if (!txs.length) return;
     try {
       var r = await api('GET', '/api/bitcoin/confirmations');
+      var bucketChanged = false;
       (r.confirmations || []).forEach(function (c) {
         var tx = (S.bitcoin.txs || []).find(function (t) { return t.id === c.id; });
         if (tx && tx.broadcasted) {
+          var before = txStatus(tx);
           tx.broadcasted.confirmations = c.confirmations;
           tx.broadcasted.blockHeight = c.blockHeight;
           tx.broadcasted.found = c.found;
           tx.broadcasted.checkedAt = c.checkedAt;
+          var after = txStatus(tx);
+          if (before.settled !== after.settled || before.pending !== after.pending) bucketChanged = true;
         }
         var card = txCardEls[c.id];
         if (card && card.sentLine && tx) card.sentLine.textContent = txBroadcastLine(tx);
         // The pill follows the network verdict too: a broadcast the
         // network no longer knows flips Broadcasted -> Failed (and
         // back if it shows up again) without waiting for a reload.
-        // Only the pill changes — the card stays put, settled, in
-        // the Archived card either way.
         if (card && card.pill && tx) {
           var pst = txStatus(tx);
           card.pill.textContent = pst.label;
           card.pill.className = 'pill ' + pst.cls;
         }
       });
+      // A tx that changed buckets (pending -> archived on its first
+      // confirmation, or back if it drops out of the mempool) needs
+      // a re-render so its card moves lists — the in-place pill
+      // update above cannot move it. load() is safe here: the bucket
+      // is stable after the move (confirmations only go up, and a
+      // Failed card stays archived), and the server caches a
+      // confirmation check for 60s, so the re-render's own refresh
+      // reads the same values and does not loop.
+      if (bucketChanged) await load();
     } catch (e) { /* the last known value stays on the card */ }
   }
   setInterval(refreshConfirmations, 60 * 1000);

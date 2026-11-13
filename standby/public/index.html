@@ -104,6 +104,10 @@
       <p id="btc-all-msg" class="muted"></p>
       <div id="btc-active-list"></div>
     </div>
+    <details class="card pending" id="pending-card" open>
+      <summary>Pending Transactions</summary>
+      <div id="btc-pending-list"></div>
+    </details>
     <details class="card archived" id="archived-card">
       <summary>Archived Transactions</summary>
       <p class="muted">Transactions that have already been broadcast, or whose inputs were declared spent.</p>
@@ -117,11 +121,29 @@
       <textarea id="btc-notes" class="plain" style="min-height:56px" placeholder="What is this one for? e.g. Pays the mortgage from the joint wallet; signed Oct 2026, RBF on."></textarea>
       <label for="btc-hex">Signed transaction (hex or PSBT)</label>
       <textarea id="btc-hex" class="plain" style="min-height:120px" placeholder="02000000…" spellcheck="false"></textarea>
+      <label for="btc-route">Broadcast via</label>
+      <select id="btc-route">
+        <option value="public" selected>Public mempool</option>
+        <option value="slipstream">Slipstream (MARA)</option>
+      </select>
+      <div id="btc-fallback-row" style="display:none">
+        <label for="btc-fallback">Public Fallback</label>
+        <select id="btc-fallback">
+          <option value="" selected>Never</option>
+          <option value="1">1 day</option>
+          <option value="3">3 days</option>
+          <option value="7">7 days</option>
+          <option value="14">14 days</option>
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <p id="btc-fallback-note" class="muted"></p>
+      </div>
       <p>
         <button id="btn-btc-add" class="primary">+ Add transaction</button>
         <button id="btn-btc-import-file">Import from file…</button>
         <input type="file" id="btc-file" accept=".txt,.hex,.psbt,text/plain" style="display:none">
-        <button id="btn-btc-cancel-edit" style="display:none">Cancel</button>
       </p>
       <p id="btc-msg" class="muted"></p>
     </div>
@@ -227,6 +249,50 @@
       <button id="confirm-proceed" class="danger">Broadcast — I understand</button>
       <button id="confirm-cancel">Cancel</button>
     </p>
+  </div>
+</div>
+
+<!-- Edit-transaction popup (0.7.16 amendment): editing used to
+     hijack the Add-transaction card at the bottom of the tab, which
+     scrolled the page all the way down on a phone. It is a popup
+     now — the Add card stays "Add" only. -->
+<div id="edit-modal" class="modal-overlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <button id="edit-modal-x" class="modal-x" aria-label="Close">×</button>
+    <h3 id="edit-form-title">Edit transaction</h3>
+    <p id="edit-locked-note" class="muted" style="display:none">The hex and broadcast route cannot be changed once the transaction has been broadcast.</p>
+    <label for="edit-label">Label (optional)</label>
+    <input id="edit-label" type="text" placeholder="e.g. Move 0.5 BTC to the heir's wallet">
+    <label for="edit-notes">Notes (optional)</label>
+    <textarea id="edit-notes" class="plain" style="min-height:56px" placeholder="What is this one for?"></textarea>
+    <label for="edit-hex">Signed transaction (hex or PSBT)</label>
+    <textarea id="edit-hex" class="plain" style="min-height:120px" placeholder="02000000…" spellcheck="false"></textarea>
+    <label for="edit-route">Broadcast via</label>
+    <select id="edit-route">
+      <option value="public" selected>Public mempool</option>
+      <option value="slipstream">Slipstream (MARA)</option>
+    </select>
+    <div id="edit-fallback-row" style="display:none">
+      <label for="edit-fallback">Public Fallback</label>
+      <select id="edit-fallback">
+        <option value="" selected>Never</option>
+        <option value="1">1 day</option>
+        <option value="3">3 days</option>
+        <option value="7">7 days</option>
+        <option value="14">14 days</option>
+        <option value="30">30 days</option>
+        <option value="60">60 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <p id="edit-fallback-note" class="muted" style="display:none">The deadline is counted from when MARA first received the transaction. This count won't change if fallback is set sooner or later.</p>
+    </div>
+    <p>
+      <button id="btn-edit-save" class="primary">Save changes</button>
+      <button id="btn-edit-import-file">Import from file…</button>
+      <input type="file" id="edit-file" accept=".txt,.hex,.psbt,text/plain" style="display:none">
+      <button id="btn-edit-cancel">Cancel</button>
+    </p>
+    <p id="edit-msg" class="muted"></p>
   </div>
 </div>
 

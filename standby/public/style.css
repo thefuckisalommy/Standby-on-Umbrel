@@ -22,6 +22,12 @@ body {
   color: var(--ink);
   font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
+/* The page must never scroll horizontally — no <select> dropdown,
+   modal, or menu may widen it on a phone. overflow-x: clip (not
+   hidden) so this does not create a scroll container and break the
+   sticky header or the sticky table headers; the hidden line is
+   only a fallback for browsers without clip support. */
+html, body { overflow-x: hidden; overflow-x: clip; }
 header.appbar {
   position: sticky; top: 0; z-index: 50;
   background: var(--card);
@@ -85,6 +91,14 @@ input[type="password"], textarea, select {
   width: 100%; padding: 9px 10px; font: inherit; font-size: 15px;
   border: 1px solid var(--line); border-radius: 6px; background: #0f1115; color: var(--ink);
 }
+/* A <select> must never be wider than its container. Its intrinsic
+   width is the longest <option> ("Slipstream (MARA)"), and on a
+   phone the native dropdown popout can force the select — and the
+   modal and page around it — wider than the viewport when it opens.
+   width: 100% alone does not cap that in every mobile browser; the
+   max-width does. Applies to all four selects (Add-form route +
+   fallback, Edit-popup route + fallback). */
+select { max-width: 100%; }
 textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px; }
 textarea.plain { font-family: inherit; }
 input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
@@ -216,6 +230,11 @@ p.inline-btns { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center;
 .modal ul.plain-list { margin: 8px 0; padding-left: 18px; }
 .modal ul.plain-list li { margin: 4px 0; overflow-wrap: anywhere; }
 .tx-card .tx-arm { margin-top: 12px; }
+/* The broadcast-route and public-fallback lines sit below the arm
+   toggle, their own rows, as plain text (0.7.17 follow-up: the
+   card selects are gone — both are changed in the Edit popup). */
+.tx-card .tx-route { margin-top: 8px; font-size: 14px; color: var(--muted); }
+.tx-card .tx-fallback { margin-top: 8px; font-size: 14px; color: var(--muted); }
 .tx-card .tx-details { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
 .tx-card .tx-details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 .tx-card .tx-notes { color: var(--muted); font-size: 14px; margin: 4px 0; }
@@ -239,12 +258,18 @@ p.inline-btns { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center;
   padding: 20px;
 }
 .modal-overlay.open { display: flex; }
+/* A modal must never scroll or widen horizontally. Its content
+   (notably a <select>'s native dropdown popout on a phone) can
+   otherwise push the modal — and the page behind it — wider than
+   the viewport when it opens. Vertical scrolling stays; horizontal
+   overflow is clipped. Covers both modals (confirm/details and
+   Edit) and the log-details pop-out. */
 .modal {
   position: relative;
   background: var(--card); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 20px;
-  max-width: 480px; width: 100%;
-  max-height: 90vh; overflow-y: auto;
+  max-width: 480px; width: 100%; min-width: 0;
+  max-height: 90vh; overflow-y: auto; overflow-x: hidden;
 }
 /* The X in the modal's top-right corner closes it — every modal
    use (confirmation, details pop-out, new-key pop-out) closes the
@@ -265,6 +290,16 @@ p.inline-btns { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center;
 .modal #btn-key-copy { margin-top: 4px; }
 .modal h3 { margin: 0 0 8px; font-size: 17px; }
 .modal p { margin: 8px 0; }
+/* The confirm body and the details pop-out must wrap long unbroken
+   strings (a txid, a hex) instead of forcing the modal wider than
+   the screen — the modal is a flex item, so its min-content would
+   otherwise beat its max-width on a phone. */
+#confirm-body, #modal-details { overflow-wrap: anywhere; }
 .modal .kv { grid-template-columns: 110px 1fr; }
 .modal .kv dd { overflow-wrap: anywhere; }
-.modal pre { max-height: 240px; }
+/* The broadcast-log details pop-out renders the full signed tx hex
+   in a <pre> — a hundreds-of-chars unbroken line. Without wrapping
+   that line is the pre's min-content width, and the modal (a flex
+   item with min-width: auto) grows wider than a phone screen to fit
+   it. Wrap the hex and keep the scroll for tall content. */
+.modal pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; max-height: 240px; overflow-y: auto; }

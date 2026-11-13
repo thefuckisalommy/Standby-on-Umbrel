@@ -5,8 +5,8 @@ manifestVersion: 1
 id: standby
 category: automation
 name: Standby
-version: "0.7.15"
-releaseNotes: "0.7.15: you can now import a signed transaction from a file instead of pasting the hex — a plain hex file, or a fully-signed PSBT (.psbt, base64 or raw binary). A PSBT is finalized on the server (P2PKH, P2WPKH, P2SH-P2WPKH, and P2WSH including M-of-N multisig) and the extracted transaction is validated exactly like a paste; a PSBT that is not fully signed is rejected, naming the inputs that are missing signatures."
+version: "0.7.17"
+releaseNotes: "0.7.17: Public fallback for Slipstream — an opt-in per-transaction timer. If a Slipstream transaction is not publicly visible within the chosen number of days (1, 3, 7, 14, 30, 60, or 90; Never by default), Standby broadcasts it publicly instead. The deadline runs from when MARA first accepted it, and changing the duration while it waits re-times the deadline from that same acceptance; a transaction whose Slipstream submit keeps failing falls back from its first attempt instead. The fallback is checked on the hourly tick and on a manual release check, after the MARA status refresh — it is the only automatic public broadcast, and a check-in does not cancel a due fallback. The manual “Broadcast publicly” escape hatch is unchanged."
 tagline: Presigned Bitcoin transactions, ready when they're needed.
 description: |-
   Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.

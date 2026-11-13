@@ -3,7 +3,7 @@
 // Serves the static UI and a JSON API backed by plain files in DATA_DIR.
 // Run:  PORT=3100 DATA_DIR=./data node server.js
 //
-// What this app is (0.7.14): a dead man's switch that does ONE thing —
+// What this app is (0.7.17): a dead man's switch that does ONE thing —
 // broadcast the owner's pre-signed Bitcoin transactions if they stop
 // checking in past the broadcast threshold — or immediately, on the
 // owner's say-so (Broadcast Now on a transaction's own card, or
@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.15';
+const VERSION = '0.7.17';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -108,6 +108,69 @@ function clampInt(v, def, min, max) {
 function asStr(v, maxLen) {
   if (typeof v !== 'string') return '';
   return v.slice(0, maxLen);
+}
+
+// Broadcast route (0.7.16): which network a transaction goes out
+// on. 'public' is the mempool nodes (primary, then secondary);
+// 'slipstream' is MARA Slipstream (direct to MARA Pool's private
+// mempool). Per transaction, chosen when it is added and changeable
+// on its card — the two routes are never a fallback chain: only the
+// selected route is attempted, and the hourly retry re-attempts that
+// same route. Anything else (including a missing value on an older
+// record or backup) is 'public'.
+function validBroadcastVia(v) {
+  return v === 'slipstream' ? 'slipstream' : 'public';
+}
+
+// Public fallback (0.7.17): a per-transaction OPT-IN timer on a
+// Slipstream-route transaction. If the transaction is not publicly
+// visible within the chosen number of days, Standby broadcasts it
+// publicly instead — the automatic version of the manual "Broadcast
+// publicly" escape hatch, for when nobody is watching. The allowed
+// durations are the seven the UI offers; anything else (including a
+// missing value on an older record or backup) is null — Never, no
+// automatic fallback. The fallback only applies while the route is
+// 'slipstream'; the value is stored (and kept) when the route is
+// 'public', but ignored. It is deliberately lenient, like
+// validBroadcastVia above: an invalid value becomes Never, never a
+// 400.
+const PUBLIC_FALLBACK_DAYS = [1, 3, 7, 14, 30, 60, 90];
+function validPublicFallbackDays(v) {
+  return (typeof v === 'number' && PUBLIC_FALLBACK_DAYS.includes(v)) ? v : null;
+}
+
+// The deadline a Slipstream transaction's public fallback fires at —
+// or null when there is none. Two anchors, by the transaction's
+// state (the owner's rule):
+//   (a) 'submitted-slipstream' (MARA accepted it): the deadline runs
+//       from when MARA first accepted it — release.submittedAt. A
+//       change of duration while pending re-times the deadline from
+//       that same submittedAt; it does NOT restart the clock.
+//   (b) still 'release-due' because the submit keeps failing (never
+//       got the 200+success): the deadline runs from the FIRST
+//       Slipstream broadcast attempt — slipstreamFirstAttemptAt,
+//       set on the first attempt whether it succeeds or fails, never
+//       overwritten after. If no attempt has been made yet, there is
+//       no deadline (nothing to fall back from).
+// A tx that succeeded on the first try has firstAttemptAt ==
+// submittedAt, so the two anchors agree there; a tx that failed
+// first and succeeded later anchors on (a), the acceptance — the
+// fallback is about MARA holding it, not about our first try.
+function fallbackDeadline(tx) {
+  if (!tx || tx.broadcastVia !== 'slipstream') return null;
+  const days = validPublicFallbackDays(tx.publicFallbackDays);
+  if (days === null) return null;
+  let anchor = null;
+  if (tx.release && tx.release.status === 'submitted-slipstream' && tx.release.submittedAt) {
+    anchor = tx.release.submittedAt;
+  } else if (tx.slipstreamFirstAttemptAt) {
+    anchor = tx.slipstreamFirstAttemptAt;
+  } else {
+    return null;
+  }
+  const at = new Date(anchor).getTime();
+  if (Number.isNaN(at)) return null;
+  return new Date(at + days * 86400000);
 }
 
 // State as served to the UI: a plain deep copy, except the check-in key
@@ -297,7 +360,14 @@ function checkinStatus(state, now) {
   // either — one added after a release still waits for the next cycle.
   const txs = state.bitcoin.txs || [];
   const anyFailed = txs.some((t) => t.enabled && t.release && t.release.status === 'failed');
-  if (!anyFailed && txs.some((t) => t.release && t.release.status === 'broadcast' && t.release.kind === 'release')) {
+  // A transaction waiting on MARA (0.7.16) means the release is not
+  // done: it still needs to become visible publicly or be declared
+  // failed, so the status is not 'broadcasted' while one is waiting
+  // — even if another transaction already broadcast. Only armed
+  // transactions count (a disabled one's record is inert, like its
+  // 'failed' record).
+  const anyWaitingMara = txs.some((t) => t.enabled && t.release && t.release.status === 'submitted-slipstream');
+  if (!anyFailed && !anyWaitingMara && txs.some((t) => t.release && t.release.status === 'broadcast' && t.release.kind === 'release')) {
     return { state: 'broadcasted', label: 'Broadcasted', daysSince: d, nextDue };
   }
   if (now.getTime() < dueMs) return { state: 'on-track', label: 'On track', daysSince: d, nextDue };
@@ -333,6 +403,15 @@ function preBroadcastCheck(tx, logKind, now, opts) {
   if (ftx.hex !== tx.hex) return { ok: false, reason: 'transaction was replaced' };
   if (ftx.broadcasted || (ftx.release && ftx.release.status === 'broadcast')) return { ok: false, reason: 'already broadcast' };
   if (ftx.release && ftx.release.status === 'stale') return { ok: false, reason: 'transaction is stale — replace it to re-arm' };
+  // A transaction already submitted to Slipstream is waiting on
+  // MARA — it is not re-submitted (0.7.16). The hourly MARA-waiting
+  // refresh (refreshMaraWaiting) is what moves it on: to 'broadcast'
+  // once the public nodes see it, or back to 'failed' if MARA drops
+  // it, and only then is it attempted again. The ONE exception is
+  // the manual "Broadcast publicly" escape hatch (opts.forcePublic):
+  // the owner explicitly chose to give up the Slipstream privacy
+  // and put this tx in the public mempool, so the wait is over.
+  if (ftx.release && ftx.release.status === 'submitted-slipstream' && !(opts && opts.forcePublic)) return { ok: false, reason: 'already submitted to Slipstream — waiting on MARA' };
   if (logKind === 'release') {
     if (!ftx.enabled) return { ok: false, reason: 'transaction was disabled' };
     if (fresh.settings.paused || fresh.settings.vacationMode) return { ok: false, reason: 'paused or vacation mode' };
@@ -370,8 +449,16 @@ function preBroadcastCheck(tx, logKind, now, opts) {
 //      tx can never broadcast); an unconfirmed spend by another tx is
 //      a warning only — it does NOT block the broadcast below, the
 //      node is the arbiter.
-//   2. Broadcast via the primary node, falling back to the secondary
-//      if the primary does not answer. Success is recorded once per tx
+//   2. Broadcast via the transaction's selected route (0.7.16):
+//      'public' broadcasts via the primary node, falling back to
+//      the secondary if the primary does not answer; 'slipstream'
+//      submits to MARA Slipstream ONLY — no fallback to the public
+//      nodes. A successful Slipstream submission records status
+//      'submitted-slipstream' (not 'broadcast') and no broadcasted
+//      fact: the transaction is in MARA's private mempool, invisible
+//      to the public nodes, until refreshMaraWaiting sees it publicly
+//      (then 'broadcast') or MARA drops it (then 'failed', retried
+//      next tick via Slipstream). Success is recorded once per tx
 //      and never repeated, with the endpoint that actually broadcast;
 //      failure is recorded as 'failed' and retried on the next tick
 //      (a transient network failure must not lose the moment).
@@ -417,16 +504,23 @@ async function broadcastOneInner(state, tx, endpoints, now, logKind, opts) {
   try {
     check = await bitcoin.checkInputsUnspent(bitcoin.parseTx(tx.hex), endpoints);
   } catch (e) {
-    const record = { status: 'failed', kind: logKind, txid: tx.txid, method: 'primary', lastAttemptAt: now.toISOString(), error: 'input check failed: ' + e.message };
-    const fresh = store.loadState(DATA_DIR);
-    const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
-    if (ftx && ftx.hex === tx.hex) {
-      recordRelease(fresh, ftx, record, {
-        ts: now.toISOString(), kind: logKind, status: 'failed', method: 'primary', txid: tx.txid,
-        hexPreview: tx.hex.slice(0, 64), note: failNote + e.message,
-      });
+    // The manual "Broadcast publicly" escape hatch (forcePublic)
+    // does NOT write a 'failed' record: the tx stays
+    // Slipstream-pending if the public attempt cannot even check
+    // its inputs — the failure is surfaced to the owner, and MARA
+    // is still holding the tx.
+    if (!(opts && opts.forcePublic)) {
+      const record = { status: 'failed', kind: logKind, txid: tx.txid, method: 'primary', lastAttemptAt: now.toISOString(), error: 'input check failed: ' + e.message };
+      const fresh = store.loadState(DATA_DIR);
+      const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
+      if (ftx && ftx.hex === tx.hex) {
+        recordRelease(fresh, ftx, record, {
+          ts: now.toISOString(), kind: logKind, status: 'failed', method: 'primary', txid: tx.txid,
+          hexPreview: tx.hex.slice(0, 64), note: failNote + e.message,
+        });
+      }
     }
-    return { id: tx.id, txid: tx.txid, label: tx.label || '', action: 'failed', error: record.error };
+    return { id: tx.id, txid: tx.txid, label: tx.label || '', action: 'failed', error: 'input check failed: ' + e.message };
   }
   // Our own txid is the spender (0.7.12, third-audit finding 1):
   // this transaction is already out there — in the mempool or a
@@ -476,13 +570,66 @@ async function broadcastOneInner(state, tx, endpoints, now, logKind, opts) {
   // Broadcast for real — but only after re-verifying against fresh
   // state (see preBroadcastCheck above): a check-in, pause, disable,
   // or replacement that landed while the input check was on the
-  // network must stop the broadcast.
+  // network must stop the broadcast. The route is the transaction's
+  // own broadcastVia (0.7.16): 'public' broadcasts via the mempool
+  // nodes (primary, then secondary); 'slipstream' submits to MARA
+  // Slipstream ONLY. There is no cross-route fallback — if the
+  // selected route fails, the transaction is 'failed' and the next
+  // evaluation retries that same route. The manual "Broadcast
+  // publicly" escape hatch (opts.forcePublic) overrides the route:
+  // it always goes public, whatever the stored route says.
   const pre = preBroadcastCheck(tx, logKind, now, opts);
   if (!pre.ok) {
     return { id: tx.id, txid: tx.txid, label: tx.label || '', action: 'skipped', reason: pre.reason };
   }
+  const via = (opts && opts.forcePublic) ? 'public' : (pre.tx.broadcastVia === 'slipstream' ? 'slipstream' : 'public');
+  // (0.7.17) The first Slipstream attempt — success or fail — is the
+  // deadline anchor for a transaction whose submit keeps failing
+  // (case (b) of fallbackDeadline). Record it once, before the
+  // network call, so it is set even if the attempt itself throws;
+  // never overwrite it after. The success and failure branches below
+  // reload fresh state, so this write survives them.
+  if (via === 'slipstream') {
+    const fresh0 = store.loadState(DATA_DIR);
+    const ftx0 = (fresh0.bitcoin.txs || []).find((t) => t.id === tx.id);
+    if (ftx0 && ftx0.hex === tx.hex && !ftx0.slipstreamFirstAttemptAt) {
+      ftx0.slipstreamFirstAttemptAt = now.toISOString();
+      store.saveState(DATA_DIR, fresh0);
+    }
+  }
+  // (0.7.17) The public fallback (refreshPublicFallbacks) passes
+  // fallbackDays: its presence means this public broadcast is the
+  // automatic fallback for a Slipstream transaction that ran out its
+  // timer — the broadcast log must say why it went public, so the
+  // note is prefixed onto the broadcast entry broadcastTx writes.
+  const fallbackNote = (opts && typeof opts.fallbackDays === 'number')
+    ? 'Public fallback: this Slipstream transaction was not publicly visible within ' + opts.fallbackDays + (opts.fallbackDays === 1 ? ' day' : ' days') + ', so Standby broadcast it publicly instead.'
+    : null;
   try {
-    const out = await bitcoin.broadcastTx(DATA_DIR, { hex: pre.tx.hex, txid: pre.tx.txid, endpoints });
+    if (via === 'slipstream') {
+      // A successful Slipstream submission is NOT a broadcast yet:
+      // the transaction is in MARA's private mempool, invisible to
+      // the public nodes. It gets its own release status,
+      // 'submitted-slipstream' — a pseudo-pending-but-success state
+      // — and NO broadcasted fact (that fact is written only once
+      // the public nodes see it, by refreshMaraWaiting). The release
+      // is not complete while any transaction is in this state.
+      const out = await bitcoin.broadcastViaSlipstream(pre.tx.hex, pre.tx.txid);
+      const record = { status: 'submitted-slipstream', kind: logKind, txid: out.txid, method: 'slipstream', submittedAt: now.toISOString() };
+      const fresh = store.loadState(DATA_DIR);
+      const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
+      if (ftx && ftx.hex === tx.hex) {
+        ftx.release = record;
+        store.saveState(DATA_DIR, fresh);
+      }
+      store.appendBroadcastLog(DATA_DIR, {
+        ts: now.toISOString(), kind: logKind, status: 'submitted-slipstream', method: 'slipstream', txid: out.txid,
+        hexPreview: pre.tx.hex.slice(0, 64),
+        note: 'Submitted to MARA Slipstream — waiting for MARA to mine it. Not visible in the public mempool yet.',
+      });
+      return { id: tx.id, txid: out.txid, label: tx.label || '', action: 'submitted-slipstream', method: 'slipstream' };
+    }
+    const out = await bitcoin.broadcastTx(DATA_DIR, { hex: pre.tx.hex, txid: pre.tx.txid, endpoints, notePrefix: fallbackNote });
     // Merge-only write (audit finding 1): the broadcast itself was
     // just on the network, and anything may have landed while it was
     // out there — a check-in, a settings change, a disable. Saving
@@ -498,6 +645,10 @@ async function broadcastOneInner(state, tx, endpoints, now, logKind, opts) {
     const fresh = store.loadState(DATA_DIR);
     const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
     if (ftx && ftx.hex === tx.hex) {
+      // The escape hatch went public: the stored route follows the
+      // tx — it is a public tx now, and if it ever drops back to
+      // 'release-due' it retries via the public route.
+      if (opts && opts.forcePublic) ftx.broadcastVia = 'public';
       ftx.release = record;
       ftx.broadcasted = {
         txid: out.txid, broadcastedAt: now.toISOString(), method: out.method,
@@ -507,10 +658,23 @@ async function broadcastOneInner(state, tx, endpoints, now, logKind, opts) {
     }
     return { id: tx.id, txid: out.txid, label: tx.label || '', action: 'broadcast', method: out.method };
   } catch (e) {
-    const record = { status: 'failed', kind: logKind, txid: tx.txid, method: 'primary', lastAttemptAt: now.toISOString(), error: e.message };
-    const fresh = store.loadState(DATA_DIR);
-    const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
-    if (ftx && ftx.hex === tx.hex) recordRelease(fresh, ftx, record, null); // broadcastTx already logged the failure
+    // A failed attempt (either route) is 'failed' and retried on
+    // the next evaluation via the SAME selected route (0.7.14 retry
+    // rule). For Slipstream the error carries Slipstream's own
+    // rejection reason (a fee below the floor, a sanctions
+    // rejection, an invalid tx). The method names the route that
+    // failed: 'slipstream' for Slipstream, 'primary' for the public
+    // route (the first endpoint tried — the pre-0.7.16 convention).
+    // EXCEPT the manual "Broadcast publicly" escape hatch
+    // (forcePublic): a failed public attempt does NOT write a
+    // 'failed' record — the tx stays Slipstream-pending, still in
+    // MARA's queue, and the error is surfaced to the owner instead.
+    const record = { status: 'failed', kind: logKind, txid: tx.txid, method: via === 'slipstream' ? 'slipstream' : 'primary', lastAttemptAt: now.toISOString(), error: e.message };
+    if (!(opts && opts.forcePublic)) {
+      const fresh = store.loadState(DATA_DIR);
+      const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id);
+      if (ftx && ftx.hex === tx.hex) recordRelease(fresh, ftx, record, null); // broadcastTx already logged the failure
+    }
     return { id: tx.id, txid: tx.txid, label: tx.label || '', action: 'failed', error: e.message };
   }
 }
@@ -619,6 +783,15 @@ async function evaluateReleaseInner() {
       results.push({ id: tx.id, txid: tx.txid, label: tx.label || '', action: 'skipped', reason: 'transaction is stale — replace it to re-arm' });
       continue;
     }
+    // Already submitted to Slipstream and waiting on MARA (0.7.16):
+    // it is not re-submitted. refreshMaraWaiting (run after this
+    // evaluation, on the tick and on the manual release check) is
+    // what moves it on — to 'broadcast' once the public nodes see
+    // it, or back to 'failed' if MARA drops it.
+    if (tx.release && tx.release.status === 'submitted-slipstream') {
+      results.push({ id: tx.id, txid: tx.txid, label: tx.label || '', action: 'skipped', reason: 'submitted to Slipstream — waiting on MARA' });
+      continue;
+    }
     // releaseRun: the release decision was made once, above — a
     // check-in landing mid-run is recorded but does not stop the
     // remaining transactions (all-or-none, 0.7.10).
@@ -686,6 +859,206 @@ async function refreshConfirmations(state, maxAgeSec) {
   return out;
 }
 
+// Refresh the MARA-waiting transactions (0.7.16). For every tx
+// whose release status is 'submitted-slipstream' — submitted to MARA
+// Slipstream, not yet visible in the public mempool — check BOTH:
+//   (a) the public node lookup: if the tx is now visible (in the
+//       public mempool, unconfirmed, or confirmed) it is out there —
+//       mined or relayed — so it becomes 'broadcast', with the
+//       permanent broadcasted fact (method 'slipstream', since that
+//       is how it went out). The release is then complete for it.
+//   (b) Slipstream's own status endpoint: if it reports the tx as
+//       failed/dropped (MARA no longer lists it), the tx is 'failed'
+//       — the standard failure path — and the next evaluation retries
+//       it via Slipstream (the 0.7.14 retry rule). If Slipstream
+//       still shows it queued, the queue info (position, next-block
+//       likelihood) is refreshed on the record and the tx stays
+//       'submitted-slipstream'.
+// A status check that itself fails (endpoint down, unparseable)
+// changes nothing — the tx stays waiting and is checked again next
+// tick. This is a status refresh, not a broadcast: it runs on the
+// hourly tick and on the manual release check regardless of the
+// check-in clock (a MARA-waiting tx needs its status kept current
+// even while the clock is on-track), and it is NOT withheld by an
+// unreadable receiver check-in state (it writes no broadcast, only
+// status). Returns [{ id, txid, action }] — 'broadcast', 'failed',
+// 'still-waiting', or 'unchanged' (the status check failed).
+async function refreshMaraWaiting(state) {
+  const endpoints = bitcoin.endpointsFor(state.settings);
+  const now = new Date();
+  const out = [];
+  const updates = [];
+  for (const tx of (state.bitcoin.txs || []).filter((t) => t.release && t.release.status === 'submitted-slipstream')) {
+    // (a) Public visibility first: if the public nodes see it, it
+    // is out there and the release is done for this tx.
+    let conf = null;
+    try { conf = await bitcoin.getConfirmations(tx.txid, endpoints); } catch (e) { conf = null; }
+    if (conf && conf.found) {
+      updates.push({ id: tx.id, txid: tx.txid, kind: 'broadcast', confirmations: conf.confirmations, blockHeight: conf.blockHeight, checkedAt: new Date().toISOString() });
+      out.push({ id: tx.id, txid: tx.txid, action: 'broadcast' });
+      continue;
+    }
+    // (b) Not visible publicly — ask Slipstream whether it still
+    // has it.
+    const ms = await bitcoin.getSlipstreamTxStatus(tx.txid);
+    if (ms.state === 'confirmed') {
+      // MARA mined it (the public nodes have not caught up yet).
+      updates.push({ id: tx.id, txid: tx.txid, kind: 'broadcast', confirmations: null, blockHeight: ms.blockHeight, checkedAt: new Date().toISOString() });
+      out.push({ id: tx.id, txid: tx.txid, action: 'broadcast' });
+      continue;
+    }
+    if (ms.state === 'failed') {
+      updates.push({ id: tx.id, txid: tx.txid, kind: 'failed', error: 'Slipstream no longer lists this transaction — dropped from MARA\u2019s queue' });
+      out.push({ id: tx.id, txid: tx.txid, action: 'failed' });
+      continue;
+    }
+    if (ms.state === 'queued') {
+      updates.push({
+        id: tx.id, txid: tx.txid, kind: 'queue',
+        mara: { position: ms.position, isNextBlock: ms.isNextBlock, last24hOdds: ms.last24hOdds, last7dOdds: ms.last7dOdds, checkedAt: new Date().toISOString() },
+      });
+      out.push({ id: tx.id, txid: tx.txid, action: 'still-waiting' });
+      continue;
+    }
+    // 'unknown': the status check itself failed — leave the tx
+    // waiting, check again next tick.
+    out.push({ id: tx.id, txid: tx.txid, action: 'unchanged' });
+  }
+  if (updates.length) {
+    // Merge into FRESH state (see refreshConfirmations): an edit
+    // landing while the lookups were on the network would otherwise
+    // be clobbered by the save of this stale copy.
+    const fresh = store.loadState(DATA_DIR);
+    let changed = false;
+    for (const u of updates) {
+      const tx = (fresh.bitcoin.txs || []).find((t) => t.id === u.id && t.release && t.release.status === 'submitted-slipstream');
+      if (!tx) continue;
+      if (u.kind === 'broadcast') {
+        // Keep the record's kind ('release' vs 'broadcast'): the
+        // check-in status turns 'broadcasted' only for a release
+        // kind, exactly as for a public broadcast.
+        const kind = tx.release.kind || 'release';
+        tx.release = { status: 'broadcast', kind, txid: u.txid, method: 'slipstream', broadcastedAt: now.toISOString() };
+        tx.broadcasted = {
+          txid: u.txid, broadcastedAt: now.toISOString(), method: 'slipstream',
+          confirmations: u.confirmations, blockHeight: u.blockHeight, found: true, checkedAt: u.checkedAt,
+        };
+        store.appendBroadcastLog(DATA_DIR, {
+          ts: now.toISOString(), kind: 'release', status: 'broadcast', method: 'slipstream', txid: u.txid,
+          hexPreview: tx.hex.slice(0, 64),
+          note: 'A Slipstream-submitted transaction is now visible via the public nodes — recorded as broadcast.',
+        });
+        changed = true;
+      } else if (u.kind === 'failed') {
+        tx.release = { status: 'failed', kind: tx.release.kind || 'release', txid: u.txid, method: 'slipstream', lastAttemptAt: now.toISOString(), error: u.error };
+        store.appendBroadcastLog(DATA_DIR, {
+          ts: now.toISOString(), kind: 'release', status: 'failed', method: 'slipstream', txid: u.txid,
+          hexPreview: tx.hex.slice(0, 64),
+          note: u.error + '. It will be retried via Slipstream on the next hourly check.',
+        });
+        changed = true;
+      } else if (u.kind === 'queue') {
+        tx.release.mara = u.mara;
+        changed = true;
+      }
+    }
+    if (changed) store.saveState(DATA_DIR, fresh);
+  }
+  return out;
+}
+
+// Public fallback (0.7.17): the automatic version of the manual
+// "Broadcast publicly" escape hatch. For each Slipstream-route tx
+// whose fallback deadline (fallbackDeadline) has passed, that is not
+// publicly visible and not stale: broadcast it publicly via the
+// existing broadcastTx (primary, then secondary). On success the
+// stored route becomes 'public' (broadcastOne with forcePublic does
+// that), the broadcasted fact is set, and the broadcast-log entry
+// names the fallback (notePrefix via opts.fallbackDays). On failure
+// the tx is left as-is — still Slipstream-pending or release-due —
+// and the next tick re-attempts it (the deadline has passed, so every
+// tick re-attempts until it succeeds or the tx resolves). NO 'failed'
+// release record is written for a fallback failure (forcePublic
+// skips it): the fallback re-attempt is its own cadence, and a
+// 'failed' record would confuse the retry rule — exactly the manual
+// escape hatch's reasoning.
+// Guards — the fallback does NOT fire when: the duration is Never
+// (null); the route is not slipstream; the tx is disarmed (the owner
+// said don't broadcast it); the switch is paused or in vacation mode
+// (pause means don't broadcast anything); the tx is already
+// broadcasted or carries a 'broadcast' release record (settled — a
+// restore can carry the record without the fact); the tx is stale
+// (the freshness gate inside broadcastOne marks it stale and never
+// broadcasts it). Public visibility is checked FIRST: if the public
+// nodes already see the tx, it is marked broadcast (the normal
+// recognition path — method is the node that reported it) and no
+// fallback broadcast happens.
+// A check-in does NOT cancel a due fallback: the fallback is not
+// part of the release evaluation's clock gate (it runs alongside
+// refreshMaraWaiting, regardless of the clock), and its deadline is
+// anchored on submittedAt / firstAttemptAt, not on the cycle — a
+// check-in clears the cycle record, but the next tick re-evaluates
+// the same past deadline and fires. This is the point of the timer:
+// the tx goes public even when nobody is watching.
+// Runs on the hourly tick and on the manual release check, AFTER
+// refreshMaraWaiting, so a tx MARA just confirmed as visible is not
+// also fallback-broadcast. It is NOT reachable from Broadcast All
+// (that path never calls it) and NOT triggered by the manual escape
+// hatch (a separate, immediate path). Returns [{ id, txid, action,
+// ... }] — 'broadcast', 'failed', or 'stale' per tx.
+async function refreshPublicFallbacks(state) {
+  const out = [];
+  if (state.settings.paused || state.settings.vacationMode) return out;
+  const endpoints = bitcoin.endpointsFor(state.settings);
+  const now = new Date();
+  for (const tx of (state.bitcoin.txs || [])) {
+    if (tx.broadcastVia !== 'slipstream') continue;
+    if (!tx.enabled) continue;
+    if (validPublicFallbackDays(tx.publicFallbackDays) === null) continue;
+    if (tx.broadcasted) continue;
+    if (tx.release && (tx.release.status === 'stale' || tx.release.status === 'broadcast')) continue;
+    const deadline = fallbackDeadline(tx);
+    if (!deadline || now.getTime() < deadline.getTime()) continue;
+    // Public visibility first: if the nodes already see it, it is
+    // out there — mark it broadcast, do not send it again. (For a
+    // submitted-slipstream tx refreshMaraWaiting normally gets here
+    // first; this branch is mostly for a release-due tx whose submit
+    // kept failing but which is visible anyway — someone else sent
+    // it, or MARA mined it without the status endpoint knowing.)
+    let conf = null;
+    try { conf = await bitcoin.getConfirmations(tx.txid, endpoints); } catch (e) { conf = null; }
+    if (conf && conf.found) {
+      const fresh = store.loadState(DATA_DIR);
+      const ftx = (fresh.bitcoin.txs || []).find((t) => t.id === tx.id && t.hex === tx.hex && !t.broadcasted);
+      if (ftx) {
+        const kind = (ftx.release && ftx.release.kind) || 'release';
+        ftx.release = { status: 'broadcast', kind, txid: tx.txid, method: conf.checkedVia || 'slipstream', broadcastedAt: now.toISOString() };
+        ftx.broadcasted = {
+          txid: tx.txid, broadcastedAt: now.toISOString(), method: conf.checkedVia || 'slipstream',
+          confirmations: conf.confirmations, blockHeight: conf.blockHeight, found: true, checkedAt: new Date().toISOString(),
+        };
+        store.appendBroadcastLog(DATA_DIR, {
+          ts: now.toISOString(), kind: 'release', status: 'broadcast', method: conf.checkedVia || 'slipstream', txid: tx.txid,
+          hexPreview: tx.hex.slice(0, 64),
+          note: 'A Slipstream transaction whose public-fallback deadline had passed is already visible via the public nodes — recorded as broadcast; nothing was sent.',
+        });
+        store.saveState(DATA_DIR, fresh);
+      }
+      out.push({ id: tx.id, txid: tx.txid, action: 'broadcast', alreadyVisible: true });
+      continue;
+    }
+    // Not visible: broadcast it publicly. releaseRun skips the clock
+    // re-check in preBroadcastCheck (the fallback's own deadline is
+    // the trigger, not the check-in clock); forcePublic forces the
+    // public route past the 'submitted-slipstream' block, sets the
+    // stored route to 'public' on success, and skips the 'failed'
+    // record on failure. fallbackDays marks the log entry.
+    const r = await broadcastOne(state, tx, endpoints, now, 'release', { releaseRun: true, forcePublic: true, fallbackDays: tx.publicFallbackDays });
+    out.push({ id: tx.id, txid: tx.txid, action: r.action, method: r.method, error: r.error, reason: r.reason });
+  }
+  return out;
+}
+
 // One release tick: load fresh state, evaluate. Runs hourly and once
 // shortly after startup (see the bottom of this file). The tick also
 // re-tests the nodes, so the Dashboard status is fresh even when the
@@ -716,6 +1089,24 @@ async function runReleaseTick() {
     const st = store.loadState(DATA_DIR);
     await refreshConfirmations(st, 0);
   } catch (e) { console.error('confirmations refresh failed:', e); }
+  // MARA-waiting transactions (0.7.16): a Slipstream submission
+  // that is not yet visible publicly needs its status kept current
+  // even while the clock is on-track — the refresh runs after the
+  // evaluation (so a tx MARA just dropped is retried on the NEXT
+  // tick, not in this one) and regardless of the clock.
+  try {
+    const st = store.loadState(DATA_DIR);
+    await refreshMaraWaiting(st);
+  } catch (e) { console.error('MARA-waiting refresh failed:', e); }
+  // Public fallback (0.7.17): a Slipstream transaction whose
+  // fallback deadline has passed goes public — after the MARA
+  // refresh above, so a tx MARA just confirmed as visible is not
+  // also fallback-broadcast. Runs regardless of the clock, like the
+  // MARA refresh.
+  try {
+    const st = store.loadState(DATA_DIR);
+    await refreshPublicFallbacks(st);
+  } catch (e) { console.error('public-fallback refresh failed:', e); }
 }
 
 // Test both nodes and save the per-endpoint results, so the Dashboard
@@ -802,7 +1193,7 @@ function csrfAllowed(req) {
 // the transaction stays active and a broadcast is still attempted.
 // A backup carrying any other status is not a real record (0.7.12,
 // third-audit finding 4).
-const RELEASE_STATUSES = new Set(['stale', 'failed', 'broadcast', 'conflict']);
+const RELEASE_STATUSES = new Set(['stale', 'failed', 'broadcast', 'conflict', 'submitted-slipstream']);
 // The kinds a release record may carry — 'release' for the automatic
 // release, 'broadcast' for a manual broadcast, 'dryrun' for a
 // dry-run verdict. Used by the restore validation (0.7.13).
@@ -881,10 +1272,22 @@ async function handleApi(req, res, pathname) {
   // so a check-in that arrived since the last read is honoured here too.
   if (req.method === 'POST' && pathname === '/api/release/check') {
     const r = await evaluateRelease();
+    // MARA-waiting transactions (0.7.16): refresh after the
+    // evaluation, so a tx MARA just dropped is retried on the next
+    // evaluation, not in this one. The response below is read from
+    // fresh state, so it already reflects the refresh.
+    try { await refreshMaraWaiting(store.loadState(DATA_DIR)); } catch (e) { console.error('MARA-waiting refresh failed:', e); }
+    // Public fallback (0.7.17): after the MARA refresh, so a tx
+    // MARA just confirmed as visible is not also fallback-broadcast.
+    // Runs regardless of the check-in clock — a due fallback fires
+    // even while the clock is on-track.
+    let fallbacks = [];
+    try { fallbacks = await refreshPublicFallbacks(store.loadState(DATA_DIR)); } catch (e) { console.error('public-fallback refresh failed:', e); }
     state = store.loadState(DATA_DIR);
     const txs = state.bitcoin.txs || [];
     return sendJson(res, 200, {
       ...r,
+      fallbacks,
       status: checkinStatus(state, now),
       releases: txs.filter((t) => t.release).map((t) => ({ id: t.id, txid: t.txid, label: t.label || '', ...t.release })),
     });
@@ -895,7 +1298,13 @@ async function handleApi(req, res, pathname) {
   // a fact about the transaction, not the cycle, so a stale transaction
   // stays stale (and archived) across check-ins — only replacing the
   // hex re-arms it. (If a broadcast already went out, the funds have
-  // already moved.)
+  // already moved.) A 'submitted-slipstream' record (0.7.16) IS
+  // cleared, like any other non-stale cycle record: the check-in ends
+  // the cycle, and the card goes back to Ready — but the transaction
+  // is still sitting in MARA's private mempool, and a check-in cannot
+  // recall it. If MARA mines it, the public-node lookup (or a fresh
+  // dry-run) recognises the tx's own txid out there and records it
+  // broadcast; if MARA drops it, the next release re-submits it.
   if (req.method === 'POST' && pathname === '/api/checkin') {
     const body = await readBody(req).catch(() => ({}));
     const method = body.method === 'telegram' ? 'telegram' : 'app';
@@ -995,15 +1404,23 @@ async function handleApi(req, res, pathname) {
   // broadcast log keeps the history. Deleting a tx drops its release
   // record with it.
   //
-  // POST   /api/bitcoin/txs      — add { txHex, label, notes }
-  // PUT    /api/bitcoin/txs/:id  — update { txHex?, label?, notes?, enabled? }
+  // POST   /api/bitcoin/txs      — add { txHex, label, notes, broadcastVia? }
+  // PUT    /api/bitcoin/txs/:id  — update { txHex?, label?, notes?, enabled?, broadcastVia? }
   // DELETE /api/bitcoin/txs/:id  — remove
   const txsMatch = pathname.match(/^\/api\/bitcoin\/txs\/([^/]+)$/);
   // One stored-transaction record, from a parsed tx and its hex —
   // shared by the paste path (POST /api/bitcoin/txs) and the file
   // import path (POST /api/bitcoin/txs/import), so the two cannot
-  // drift apart.
-  function newTxRecord(parsed, hex, label, notes) {
+  // drift apart. broadcastVia is the route the transaction goes out
+  // on ('public' or 'slipstream', 0.7.16) — default 'public'.
+  // publicFallbackDays (0.7.17) is the opt-in public-fallback
+  // duration in days, or null for Never (the default).
+  // slipstreamFirstAttemptAt (0.7.17) is the ISO timestamp of the
+  // first Slipstream broadcast attempt, success or fail — the
+  // deadline anchor for a tx whose submit keeps failing. It is set
+  // by broadcastOneInner, never by the client, and never overwritten
+  // once set.
+  function newTxRecord(parsed, hex, label, notes, broadcastVia, publicFallbackDays) {
     return {
       id: store.newTxId(),
       txid: parsed.txid,
@@ -1017,6 +1434,9 @@ async function handleApi(req, res, pathname) {
       locktime: parsed.locktime,
       segwit: parsed.segwit,
       enabled: true, // new transactions are armed by default
+      broadcastVia: validBroadcastVia(broadcastVia),
+      publicFallbackDays: validPublicFallbackDays(publicFallbackDays),
+      slipstreamFirstAttemptAt: null,
       release: null,
       // broadcasted is set by broadcastOne() (release or manual) and
       // survives check-ins: { txid, broadcastedAt, method,
@@ -1059,7 +1479,7 @@ async function handleApi(req, res, pathname) {
     catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
     const dupErr = duplicateTx(parsed.txid);
     if (dupErr) return sendError(res, 400, dupErr);
-    const tx = newTxRecord(parsed, hex, body.label, body.notes);
+    const tx = newTxRecord(parsed, hex, body.label, body.notes, body.broadcastVia, body.publicFallbackDays);
     state.bitcoin.txs.push(tx);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 201, { tx });
@@ -1121,7 +1541,7 @@ async function handleApi(req, res, pathname) {
     catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
     const dupErr = duplicateTx(parsed.txid);
     if (dupErr) return sendError(res, 400, dupErr);
-    const tx = newTxRecord(parsed, hex, body.label, body.notes);
+    const tx = newTxRecord(parsed, hex, body.label, body.notes, body.broadcastVia, body.publicFallbackDays);
     state.bitcoin.txs.push(tx);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 201, { tx });
@@ -1141,26 +1561,58 @@ async function handleApi(req, res, pathname) {
       let parsed;
       try { parsed = bitcoin.parseTx(hex); }
       catch (e) { return sendError(res, 400, 'invalid transaction: ' + e.message); }
-      // A replacement hex that is another stored transaction's txid
-      // is a duplicate; the tx's own hex (unchanged) is fine.
-      const dupErr = duplicateTx(parsed.txid, tx.id);
-      if (dupErr) return sendError(res, 400, dupErr);
-      tx.hex = hex;
-      tx.txid = parsed.txid;
-      tx.inputs = parsed.inputs.length;
-      tx.outputs = parsed.outputs.length;
-      tx.totalOutSats = parsed.totalOutSats;
-      tx.locktime = parsed.locktime;
-      tx.segwit = parsed.segwit;
-      // A replaced hex is a different transaction: the broadcasted fact
-      // and any release record belong to the old hex, so both are
-      // cleared. The broadcast log keeps the history.
-      tx.release = null;
-      tx.broadcasted = null;
+      // The hex is immutable once the transaction is out the door
+      // (0.7.16, Pending card): a broadcasted tx, one submitted to
+      // Slipstream and waiting on MARA, a stale tx, or a
+      // restore-carried 'broadcast' record — all Pending or Archived
+      // — cannot be replaced with a DIFFERENT transaction, because
+      // that would be a different on-chain tx. Sending the same hex
+      // back (unchanged, same txid) is a no-op, not a change, so it
+      // is allowed and changes nothing. A 'failed' or 'conflict'
+      // record is Active, not locked: its hex can still change.
+      const locked = !!(tx.broadcasted || (tx.release
+        && (tx.release.status === 'submitted-slipstream' || tx.release.status === 'stale' || tx.release.status === 'broadcast')));
+      if (locked && parsed.txid !== tx.txid) {
+        return sendError(res, 400, 'the transaction hex cannot be changed once it has been broadcast');
+      }
+      if (parsed.txid !== tx.txid) {
+        // A replacement hex that is another stored transaction's txid
+        // is a duplicate; the tx's own hex (unchanged) is fine.
+        const dupErr = duplicateTx(parsed.txid, tx.id);
+        if (dupErr) return sendError(res, 400, dupErr);
+        tx.hex = hex;
+        tx.txid = parsed.txid;
+        tx.inputs = parsed.inputs.length;
+        tx.outputs = parsed.outputs.length;
+        tx.totalOutSats = parsed.totalOutSats;
+        tx.locktime = parsed.locktime;
+        tx.segwit = parsed.segwit;
+        // A replaced hex is a different transaction: the broadcasted fact
+        // and any release record belong to the old hex, so both are
+        // cleared. The broadcast log keeps the history. (Only reachable
+        // for an unlocked tx — a locked tx with a different txid is
+        // rejected above, and a locked tx with the same txid takes the
+        // no-op path, so its broadcasted fact is never cleared here.)
+        tx.release = null;
+        tx.broadcasted = null;
+      }
     }
     if (typeof body.label === 'string') tx.label = asStr(body.label, 80);
     if (typeof body.notes === 'string') tx.notes = asStr(body.notes, 500);
     if (typeof body.enabled === 'boolean') tx.enabled = body.enabled;
+    // The route toggle on the card (0.7.16): switching the route
+    // applies to the NEXT broadcast attempt — a transaction already
+    // submitted to Slipstream is not re-submitted by toggling it
+    // (preBroadcastCheck blocks a re-submit while it waits on MARA).
+    if (typeof body.broadcastVia === 'string') tx.broadcastVia = validBroadcastVia(body.broadcastVia);
+    // The public-fallback duration (0.7.17): changeable on the card
+    // and in the edit popup, for Active and Pending txs. It is
+    // validated leniently (invalid → Never, never a 400), like the
+    // route above. A change while the tx waits on MARA re-times the
+    // deadline from the original submittedAt — the deadline is
+    // computed from submittedAt at evaluation time (see
+    // fallbackDeadline), so no clock is restarted here.
+    if (body.publicFallbackDays !== undefined) tx.publicFallbackDays = validPublicFallbackDays(body.publicFallbackDays);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 200, { tx });
   }
@@ -1179,6 +1631,35 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 200, { ok: true, id: tx.id, txid: tx.txid, label: tx.label || '', action: 'skipped', reason: 'already broadcast', tx });
     }
     const r = await broadcastOne(state, tx, bitcoin.endpointsFor(state.settings), now, 'broadcast');
+    state = store.loadState(DATA_DIR);
+    const fresh = (state.bitcoin.txs || []).find((t) => t.id === tx.id);
+    return sendJson(res, 200, { ok: true, ...r, tx: fresh });
+  }
+
+  // POST /api/bitcoin/txs/:id/broadcast-public — the MANUAL escape
+  // hatch for a slow MARA tx (0.7.16, Pending card). A transaction
+  // submitted to Slipstream and waiting on MARA is private until
+  // MARA mines it; if the owner does not want to wait, this
+  // broadcasts it via the PUBLIC route instead (mempool.space, then
+  // blockstream.info), right now, on the owner's explicit say-so.
+  // It applies ONLY to a Slipstream-pending tx (release status
+  // 'submitted-slipstream') — a public-pending tx is already public,
+  // and an active tx uses the route toggle. On success the
+  // broadcasted fact is set, the stored route becomes 'public', and
+  // the tx is public-pending (confirmed -> Archived, as usual). On
+  // failure the error is surfaced and the tx STAYS Slipstream-pending
+  // (no 'failed' record is written — MARA is still holding it).
+  // MANUAL ONLY: it is not reachable from the release evaluation or
+  // Broadcast All — only this endpoint calls broadcastOne with
+  // forcePublic, and only for the one tx named here.
+  const txBroadcastPublicMatch = pathname.match(/^\/api\/bitcoin\/txs\/([^/]+)\/broadcast-public$/);
+  if (req.method === 'POST' && txBroadcastPublicMatch) {
+    const tx = (state.bitcoin.txs || []).find((t) => t.id === txBroadcastPublicMatch[1]);
+    if (!tx) return sendError(res, 404, 'no such transaction');
+    if (!(tx.release && tx.release.status === 'submitted-slipstream')) {
+      return sendError(res, 400, 'only a transaction waiting on MARA (Slipstream-pending) can be broadcast publicly');
+    }
+    const r = await broadcastOne(state, tx, bitcoin.endpointsFor(state.settings), now, 'broadcast', { forcePublic: true });
     state = store.loadState(DATA_DIR);
     const fresh = (state.bitcoin.txs || []).find((t) => t.id === tx.id);
     return sendJson(res, 200, { ok: true, ...r, tx: fresh });
@@ -1205,12 +1686,16 @@ async function handleApi(req, res, pathname) {
       for (const id of body.ids) {
         const tx = txs.find((t) => t.id === id);
         if (!tx) return sendError(res, 400, 'unknown transaction id: ' + id);
-        if (!tx.broadcasted) targets.push(tx);
+        // A transaction already submitted to Slipstream is not
+        // re-submitted (0.7.16) — it is waiting on MARA, and the
+        // MARA-waiting refresh is what moves it on.
+        if (!tx.broadcasted && !(tx.release && tx.release.status === 'submitted-slipstream')) targets.push(tx);
       }
     } else {
-      targets = txs.filter((t) => !t.broadcasted && !(t.release && t.release.status === 'stale'));
+      targets = txs.filter((t) => !t.broadcasted && !(t.release && t.release.status === 'stale')
+        && !(t.release && t.release.status === 'submitted-slipstream'));
     }
-    if (!targets.length) return sendError(res, 400, 'nothing to broadcast — every transaction is already archived');
+    if (!targets.length) return sendError(res, 400, 'nothing to broadcast — every transaction is already archived or pending');
     const endpoints = bitcoin.endpointsFor(state.settings);
     const results = [];
     for (const tx of targets) {
@@ -1339,6 +1824,19 @@ async function handleApi(req, res, pathname) {
         locktime: parsed.locktime,
         segwit: parsed.segwit,
         enabled: typeof t.enabled === 'boolean' ? t.enabled : true,
+        // The broadcast route (0.7.16): a backup from before 0.7.16
+        // carries no route, which restores as 'public' — the same
+        // as an older record loaded from disk.
+        broadcastVia: validBroadcastVia(t.broadcastVia),
+        // The public fallback (0.7.17): a backup from before 0.7.17
+        // carries no duration, which restores as Never (null) — the
+        // same as an older record loaded from disk. The first-attempt
+        // timestamp rides along too (an unparseable one is dropped);
+        // without it a restored failing-submit tx would have no
+        // fallback deadline until its next attempt.
+        publicFallbackDays: validPublicFallbackDays(t.publicFallbackDays),
+        slipstreamFirstAttemptAt: (typeof t.slipstreamFirstAttemptAt === 'string'
+          && !Number.isNaN(new Date(t.slipstreamFirstAttemptAt).getTime())) ? t.slipstreamFirstAttemptAt : null,
         release: t.release ? t.release : null,
         broadcasted: t.broadcasted ? t.broadcasted : null,
       });
@@ -1461,7 +1959,7 @@ async function handleApi(req, res, pathname) {
         const r = await bitcoin.dryRun(DATA_DIR, { tx, endpoints: bitcoin.endpointsFor(state.settings) });
         results.push({ id: tx.id, label: tx.label || '', enabled: !!tx.enabled, ...r });
       } catch (e) {
-        results.push({ id: tx.id, txid: tx.txid, label: tx.label || '', enabled: !!tx.enabled, wouldBroadcast: false, error: e.message });
+        results.push({ id: tx.id, txid: tx.txid, label: tx.label || '', enabled: !!tx.enabled, broadcastVia: validBroadcastVia(tx.broadcastVia), wouldBroadcast: false, error: e.message });
       }
     }
     // Persist what the run found (0.7.12, third-audit finding 1 —
@@ -1529,27 +2027,36 @@ async function handleApi(req, res, pathname) {
     // wouldBroadcast is true — the release will try it) but the node
     // will reject it as non-final until the locktime passes, so it is
     // not counted here. It is named separately, so the summary never
-    // implies it will successfully broadcast right now.
+    // implies it will successfully broadcast right now. A
+    // Slipstream-route transaction is named separately too (0.7.16):
+    // it would be submitted to MARA, not broadcast to the public
+    // mempool — so if every would-be transaction is Slipstream, the
+    // summary says "would submit to Slipstream"; if only some are,
+    // it says how many are via Slipstream.
     const would = armed.filter((r) => r.wouldBroadcast && r.verdict !== 'timelocked').length;
+    const slipstream = armed.filter((r) => r.wouldBroadcast && r.verdict !== 'timelocked' && r.broadcastVia === 'slipstream').length;
     const stale = armed.filter((r) => r.spent && r.spent.length).length;
     const timelocked = armed.filter((r) => r.verdict === 'timelocked').length;
     // Dry-run all also checks that no input is spent by two stored
-    // transactions: only one of them can ever broadcast, so the shared
+    // transactions: only one of them can ever be confirmed, so the shared
     // input is flagged on both cards. A single dry-run does not run
     // this check — it is a property of the whole list. The check still
     // looks at every stored transaction (a broadcasted one is exactly
-    // why another one can never broadcast); the client only warns the
+    // why another one can never be confirmed); the client only warns the
     // cards that are not already settled.
     const overlaps = body && body.id ? [] : bitcoin.findSharedInputs(state.bitcoin.txs || []);
     const overlapNote = overlaps.length
-      ? ' Warning: ' + overlaps.length + ' input(s) are shared across transactions — only one transaction per shared input can ever broadcast: '
+      ? ' Warning: ' + overlaps.length + ' input(s) are shared across transactions — only one transaction per shared input can ever be confirmed: '
         + overlaps.map((o) => o.input.slice(0, 12) + ':' + o.input.split(':')[1] + ' in ' + o.txIds.length + ' transactions').join('; ') + '.'
       : '';
     const note = results.length === 1
       ? (results[0].note || results[0].error || '')
       : results.length === 0
         ? 'No transactions to check — every stored transaction has already been broadcast or is stale.'
-        : would + ' of ' + armed.length + ' armed transaction(s) would broadcast' + (stale ? ', ' + stale + ' stale' : '') + (timelocked ? ', ' + timelocked + ' timelocked' : '') + '.';
+        : would + ' of ' + armed.length + ' armed transaction(s) would '
+          + (slipstream > 0 && slipstream === would ? 'submit to Slipstream' : 'broadcast')
+          + (slipstream > 0 && slipstream < would ? ' (' + slipstream + ' via Slipstream)' : '')
+          + (stale ? ', ' + stale + ' stale' : '') + (timelocked ? ', ' + timelocked + ' timelocked' : '') + '.';
     return sendJson(res, 200, { ok: true, dryRun: true, results, wouldBroadcast: would > 0, overlaps, note: note + overlapNote });
   }
 
