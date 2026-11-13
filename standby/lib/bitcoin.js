@@ -94,6 +94,39 @@ function mempoolSecondaryBase(settings) {
   return normalizePublicApiUrl(v);
 }
 
+// Absolute-locktime check (0.7.14). A transaction is timelocked by
+// an absolute locktime that has not yet passed when ALL of these
+// hold:
+//   * locktime != 0, and
+//   * at least one input has a sequence below 0xffffffff (if every
+//     sequence is maxed, the locktime is ignored and the transaction
+//     is final regardless — the nLockTime rule), and
+//   * the locktime has not passed: below 500,000,000 it is a block
+//     height (timelocked while tipHeight < locktime); at or above it
+//     is a Unix timestamp (timelocked while wall-clock time <
+//     locktime — the node actually compares against the median time
+//     past, not the wall clock, so a timestamp locktime is an
+//     approximation, and the broadcast-retry loop covers the gap).
+// Returns { timelocked, until } where `until` is a number (block
+// height) or a Date (unlock time) when timelocked, else null.
+// Scope: absolute locktime ONLY. Relative timelocks (BIP 68, carried
+// in the sequences) and script timelocks (CLTV/CSV, in the output
+// scripts) are not evaluated here — they are invisible to this
+// check, so such a transaction still looks 'ready' and fails at
+// broadcast, where the retry fix (0.7.14) retakes it.
+function timelockedUntil(tx, tipHeight, now) {
+  const locktime = tx.locktime || 0;
+  if (!locktime) return { timelocked: false, until: null };
+  const anySeq = (tx.inputs || []).some((i) => (i.sequence >>> 0) !== 0xffffffff);
+  if (!anySeq) return { timelocked: false, until: null };
+  if (locktime < 500000000) {
+    if (tipHeight == null) return { timelocked: false, until: null };
+    return tipHeight < locktime ? { timelocked: true, until: locktime } : { timelocked: false, until: null };
+  }
+  const until = new Date(locktime * 1000);
+  return now.getTime() < locktime * 1000 ? { timelocked: true, until } : { timelocked: false, until: null };
+}
+
 // The endpoints in the order they are tried. A secondary identical to
 // the primary is dropped — trying the same server twice buys nothing.
 function endpointsFor(settings) {
@@ -411,8 +444,9 @@ async function dryRun(dataDir, { tx, endpoints }) {
   const fellBack = check.checkedVia !== 'primary';
   const viaNote = 'Checked via the ' + check.checkedVia + ' node (' + mempoolHostLabel(check.checkedBase) + ')'
     + (fellBack ? ' — the primary node could not be reached.' : '.');
-  // Five states (audit finding 2, extended by finding 1 in 0.7.12),
-  // and the release stays fail-open:
+  // Six states (audit finding 2, extended by finding 1 in 0.7.12
+  // and the timelock warning in 0.7.14), and the release stays
+  // fail-open:
   //   ready     — every input proven unspent; a broadcast would be attempted.
   //   unknown   — no input proven spent, but some could not be verified
   //               (the parent is unknown to the node: very recent, or a
@@ -426,6 +460,15 @@ async function dryRun(dataDir, { tx, endpoints }) {
   //               evicted, so the transaction stays active with a
   //               warning — and the release WOULD still attempt the
   //               broadcast, so wouldBroadcast is true here too.
+  //   timelocked — the transaction carries an absolute locktime that
+  //               has not passed yet, so the node would reject it as
+  //               non-final. The transaction stays active with a
+  //               warning; wouldBroadcast is true — the release WILL
+  //               attempt the broadcast (and the node will reject
+  //               it), so it is retried on the next hourly check
+  //               like any other unknown-reason failure. The dry-run
+  //               counts it as attempted, not as ready: it will not
+  //               land until the locktime passes.
   //   broadcast — the node reports this transaction's OWN txid as the
   //               spending transaction: it is already out there. Nothing
   //               to send, so wouldBroadcast is false.
@@ -435,9 +478,28 @@ async function dryRun(dataDir, { tx, endpoints }) {
   // Precedence: a confirmed competing spend beats everything (our
   // transaction can never land); our own txid out there beats a mere
   // conflict (the transaction already exists — the other inputs are
-  // moot); a conflict beats unknown.
+  // moot); a timelock beats a conflict (the transaction cannot land
+  // yet, whatever the inputs say); a conflict beats unknown.
+  // The tip height is fetched only when the transaction actually
+  // carries a height locktime with a live sequence — a timestamp
+  // locktime needs only the wall clock, and a locktime of 0 (or one
+  // with every sequence maxed) needs no network at all. If the tip
+  // fetch fails, the dry-run fails open: the transaction is reported
+  // as it would be without the timelock check, and the broadcast
+  // (with its retry) is the arbiter.
+  let timelock = { timelocked: false, until: null };
+  if (parsed.locktime && parsed.locktime < 500000000
+    && (parsed.inputs || []).some((i) => (i.sequence >>> 0) !== 0xffffffff)) {
+    let tipHeight = null;
+    try { tipHeight = await mempoolTipHeight(check.checkedBase); } catch { tipHeight = null; }
+    timelock = timelockedUntil(parsed, tipHeight, new Date());
+  } else if (parsed.locktime && parsed.locktime >= 500000000
+    && (parsed.inputs || []).some((i) => (i.sequence >>> 0) !== 0xffffffff)) {
+    timelock = timelockedUntil(parsed, null, new Date());
+  }
   const verdict = check.spent.length ? 'blocked'
     : check.own.length ? 'broadcast'
+    : timelock.timelocked ? 'timelocked'
     : check.conflict.length ? 'conflict'
     : check.unknown.length ? 'unknown' : 'ready';
   const wouldBroadcast = check.spent.length === 0 && check.own.length === 0;
@@ -447,7 +509,9 @@ async function dryRun(dataDir, { tx, endpoints }) {
       ? check.spent.length + ' input(s) no longer unspent — this transaction is stale and will not be broadcast. ' + viaNote
       : verdict === 'broadcast'
         ? 'This transaction is already out there — the node reports its own txid as the spending transaction — so it is recorded as broadcast. Nothing was sent. ' + viaNote
-        : verdict === 'conflict'
+        : verdict === 'timelocked'
+          ? 'This transaction is timelocked until ' + (typeof timelock.until === 'number' ? 'block ' + timelock.until : timelock.until.toISOString()) + ' — the node would reject it as non-final until then, so a broadcast would be attempted and rejected; it will be retried on the next hourly check. ' + viaNote
+          : verdict === 'conflict'
           ? check.conflict.length + ' input(s) are spent by another transaction that is not confirmed yet — the spend may still be evicted, so this transaction stays active with a warning and a broadcast will still be attempted. ' + viaNote
           : check.unknown.length + ' input(s) could not be verified — broadcast would be attempted, but the network is the arbiter. ' + viaNote;
   appendBroadcastLog(dataDir, {
@@ -469,6 +533,7 @@ async function dryRun(dataDir, { tx, endpoints }) {
     ok: true,
     wouldBroadcast,
     verdict,
+    timelockedUntil: timelock.timelocked ? (timelock.until instanceof Date ? timelock.until.toISOString() : timelock.until) : null,
     txid: tx.txid,
     checked: check.checked,
     checkedVia: check.checkedVia,
@@ -644,7 +709,7 @@ async function testOnePath(apiBase) {
 
 module.exports = {
   parseTx, checkInputsUnspent, dryRun, broadcastTx, testConnection,
-  getConfirmations, findSharedInputs,
+  getConfirmations, findSharedInputs, timelockedUntil,
   normalizePublicApiUrl, mempoolBase, endpointsFor,
   DEFAULT_PUBLIC_API_URL, DEFAULT_SECONDARY_API_URL,
 };

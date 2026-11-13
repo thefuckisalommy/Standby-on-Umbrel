@@ -9,7 +9,11 @@
 
   function setMsg(el, text, ok) {
     el.textContent = text;
-    el.style.color = ok === false ? '#f87171' : '';
+    // ok is true (fine, default colour), false (red — an error, or
+    // nothing will happen), or 'warn' (amber — a warning, e.g. a
+    // timelocked dry-run: nothing will land yet, but it is not a
+    // failure and the release will retry it).
+    el.style.color = ok === false ? '#f87171' : ok === 'warn' ? '#fbbf24' : '';
   }
 
   async function api(method, path, body) {
@@ -244,7 +248,7 @@
   // the inputs are still unspent and NEVER broadcast. Notes say what
   // each tx is for, at a glance, in the list.
   var editingId = null; // id of the tx loaded into the add form, or null
-  var dryRunResults = {}; // tx id -> { text, ok, spent, unknown, error }: the last dry-run result per transaction, shown in its own card. The *line* is page memory only — but a spent verdict is also recorded on the transaction server-side (a stale release record), a conflict verdict the same way (a conflict release record — a warning, not a verdict), and an own-txid verdict as a broadcast record, so the Stale / Conflict / Broadcasted status itself survives a refresh.
+  var dryRunResults = {}; // tx id -> { text, ok, verdict, spent, unknown, error }: the last dry-run result per transaction, shown in its own card. The *line* is page memory only — but a spent verdict is also recorded on the transaction server-side (a stale release record), a conflict verdict the same way (a conflict release record — a warning, not a verdict), and an own-txid verdict as a broadcast record, so the Stale / Conflict / Broadcasted status itself survives a refresh.
   var txCardEls = {}; // tx id -> { row, sentLine }: the rendered card, so the confirmations poll can update the sent line in place
 
   function txStats(tx) {
@@ -350,6 +354,15 @@
     }
     if ((tx.release && tx.release.status === 'stale') || (dr && dr.spent)) {
       return { label: 'Stale', cls: 'bad', settled: true };
+    }
+    // Absolute-locktime warning (0.7.14): the transaction carries a
+    // locktime that has not passed yet, so the node would reject it as
+    // non-final. The card stays active with a warning pill — and the
+    // broadcast is not gated on it, the retry fix retakes the
+    // transaction once the locktime passes. Precedence matches the
+    // dry-run: a timelock beats a conflict.
+    if (dr && dr.verdict === 'timelocked') {
+      return { label: 'Timelocked', cls: 'warn', settled: false };
     }
     if (dr && dr.error) return { label: 'Node Failure', cls: 'warn', settled: false };
     // Unconfirmed-spend warning (0.7.12, finding 1): another
@@ -538,7 +551,13 @@
       var dr = dryRunResults[tx.id];
       if (dr) {
         var dryLine = document.createElement('p');
-        dryLine.className = 'tx-dryrun muted';
+        // A timelocked dry-run is a warning, not a pass or a failure:
+        // yellow/orange (the same warn colour as the Timelocked
+        // pill), never green and never red. Keyed off the verdict,
+        // not wouldBroadcast — the release WILL attempt the
+        // broadcast, so wouldBroadcast is true here, and the line
+        // must not read as 'ready'.
+        dryLine.className = dr.verdict === 'timelocked' ? 'tx-dryrun tx-warn' : 'tx-dryrun muted';
         dryLine.textContent = dr.text;
         body.appendChild(dryLine);
       }
@@ -915,7 +934,11 @@
       // load (renderBitcoin derives them from the stored
       // transactions), so there is nothing to keep from this run —
       // the aggregate note below still names the shared inputs.
-      setMsg($('btc-all-msg'), 'Dry-run: ' + (r.note || '') + ' Nothing was broadcast.', r.wouldBroadcast);
+      // The aggregate line is amber (not red) when the only reason
+      // nothing would broadcast is timelocks: a timelocked dry-run
+      // is a warning, not a failure, and the release will retry it.
+      var anyTimelocked = (r.results || []).some(function (one) { return one.verdict === 'timelocked'; });
+      setMsg($('btc-all-msg'), 'Dry-run: ' + (r.note || '') + ' Nothing was broadcast.', r.wouldBroadcast ? true : (anyTimelocked ? 'warn' : false));
       await load();
       // The ones this run found spent move to Archived — pop up a
       // notice naming them (only the ones that moved in this run).

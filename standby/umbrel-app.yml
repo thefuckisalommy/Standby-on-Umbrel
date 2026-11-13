@@ -5,8 +5,8 @@ manifestVersion: 1
 id: standby
 category: automation
 name: Standby
-version: "0.7.13"
-releaseNotes: "0.7.13: restoring a backup now requires every release record to carry a txid matching the transaction it belongs to — a record with no txid no longer passes validation and can no longer silently disable a transaction; and the app now tells a missing check-in file apart from an unreadable one — when the receiver's check-in state cannot be read, the automatic release is held (not broadcast) until it can be read again, and the dashboard says so. The remaining audit items (concurrent-request writes, receiver rate limiting, parser checks) remain set aside as low priority."
+version: "0.7.14"
+releaseNotes: "0.7.14: a failed broadcast is now retried on the next hourly check instead of ending the release — if one armed transaction broadcasts and another fails for an unknown reason, the status stays Release Due and the failed one is tried again every hour until it succeeds or its inputs are spent; and the dry-run now warns when a transaction carries an absolute locktime that has not passed yet, reporting it as timelocked with the block height or date it unlocks, instead of calling it ready."
 tagline: Presigned Bitcoin transactions, ready when they're needed.
 description: |-
   Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.

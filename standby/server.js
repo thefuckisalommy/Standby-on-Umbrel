@@ -3,7 +3,7 @@
 // Serves the static UI and a JSON API backed by plain files in DATA_DIR.
 // Run:  PORT=3100 DATA_DIR=./data node server.js
 //
-// What this app is (0.7.13): a dead man's switch that does ONE thing —
+// What this app is (0.7.14): a dead man's switch that does ONE thing —
 // broadcast the owner's pre-signed Bitcoin transactions if they stop
 // checking in past the broadcast threshold — or immediately, on the
 // owner's say-so (Broadcast Now on a transaction's own card, or
@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.13';
+const VERSION = '0.7.14';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -253,9 +253,20 @@ function mergeExternalCheckin(state, now) {
 // Once a release has actually broadcast (the threshold was exceeded
 // and a release went out), the status is 'broadcasted' — a manual
 // broadcast does not count, only a release does (the release record
-// carries kind 'release'). A check-in clears the cycle-scoped release
-// records — a stale record survives, it is a fact about the inputs —
-// so checking in after a broadcast resets the status to 'on-track'.
+// carries kind 'release'). But 'broadcasted' means the release is
+// DONE: every armed transaction has reached a terminal state
+// (broadcasted or stale). A failed attempt is not terminal — an
+// unknown-reason failure (a node rejection, a network error, a
+// not-yet-final timelocked transaction) is retried on the next
+// hourly tick (0.7.14) — so while any ARMED transaction still
+// carries a 'failed' release record, the status stays 'release-due'
+// and the release keeps running. A stale transaction does not keep
+// it due (stale is terminal: skip it), and a transaction that has
+// never been attempted does not either — one added after a release
+// still waits for the next cycle. A check-in clears the
+// cycle-scoped release records — a stale record survives, it is a
+// fact about the inputs — so checking in after a broadcast resets
+// the status to 'on-track'.
 function checkinStatus(state, now) {
   const s = state.settings;
   const last = state.checkin.lastCheckinAt ? new Date(state.checkin.lastCheckinAt) : null;
@@ -276,7 +287,17 @@ function checkinStatus(state, now) {
   // passed the threshold).
   const dueMs = last.getTime() + s.thresholdDays * 86400000;
   const nextDue = new Date(dueMs).toISOString();
-  if ((state.bitcoin.txs || []).some((t) => t.release && t.release.status === 'broadcast' && t.release.kind === 'release')) {
+  // A 'failed' record on an ARMED transaction means the release is
+  // not done: that transaction is still owed a broadcast, and the
+  // next hourly tick retries it (0.7.14). Only armed transactions
+  // count — a disabled transaction's 'failed' record is inert (the
+  // release never attempts a disabled transaction), and a stale one
+  // is terminal, so neither keeps the status 'release-due'. A
+  // transaction that has never been attempted does not keep it due
+  // either — one added after a release still waits for the next cycle.
+  const txs = state.bitcoin.txs || [];
+  const anyFailed = txs.some((t) => t.enabled && t.release && t.release.status === 'failed');
+  if (!anyFailed && txs.some((t) => t.release && t.release.status === 'broadcast' && t.release.kind === 'release')) {
     return { state: 'broadcasted', label: 'Broadcasted', daysSince: d, nextDue };
   }
   if (now.getTime() < dueMs) return { state: 'on-track', label: 'On track', daysSince: d, nextDue };
@@ -1401,8 +1422,15 @@ async function handleApi(req, res, pathname) {
     }
     if (verdictRecorded) store.saveState(DATA_DIR, state);
     const armed = results.filter((r) => r.enabled);
-    const would = armed.filter((r) => r.wouldBroadcast).length;
+    // 'would broadcast' counts the transactions that would actually
+    // land: a timelocked transaction is attempted (its per-result
+    // wouldBroadcast is true — the release will try it) but the node
+    // will reject it as non-final until the locktime passes, so it is
+    // not counted here. It is named separately, so the summary never
+    // implies it will successfully broadcast right now.
+    const would = armed.filter((r) => r.wouldBroadcast && r.verdict !== 'timelocked').length;
     const stale = armed.filter((r) => r.spent && r.spent.length).length;
+    const timelocked = armed.filter((r) => r.verdict === 'timelocked').length;
     // Dry-run all also checks that no input is spent by two stored
     // transactions: only one of them can ever broadcast, so the shared
     // input is flagged on both cards. A single dry-run does not run
@@ -1419,7 +1447,7 @@ async function handleApi(req, res, pathname) {
       ? (results[0].note || results[0].error || '')
       : results.length === 0
         ? 'No transactions to check — every stored transaction has already been broadcast or is stale.'
-        : would + ' of ' + armed.length + ' armed transaction(s) would broadcast' + (stale ? ', ' + stale + ' stale' : '') + '.';
+        : would + ' of ' + armed.length + ' armed transaction(s) would broadcast' + (stale ? ', ' + stale + ' stale' : '') + (timelocked ? ', ' + timelocked + ' timelocked' : '') + '.';
     return sendJson(res, 200, { ok: true, dryRun: true, results, wouldBroadcast: would > 0, overlaps, note: note + overlapNote });
   }
 
