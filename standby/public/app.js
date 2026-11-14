@@ -53,6 +53,32 @@
     return n + (n === 1 ? ' day' : ' days');
   }
 
+  // Satoshis (a decimal string) -> BTC with up to 8 decimals,
+  // trailing zeros trimmed: "100000" -> "0.001", "12500000" ->
+  // "0.125". BigInt, so no float ever touches the amount.
+  function fmtBtc(satsStr) {
+    var sats = BigInt(satsStr || '0');
+    var whole = sats / 100000000n;
+    var frac = sats % 100000000n;
+    if (frac === 0n) return whole.toString();
+    return whole.toString() + '.' + frac.toString().padStart(8, '0').replace(/0+$/, '');
+  }
+
+  // Satoshis with thousands separators: "100000" -> "100,000".
+  function fmtSats(satsStr) {
+    return String(satsStr == null ? '0' : satsStr).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  // A fee rate in sat/vB, ONE decimal at most, trailing zeros
+  // trimmed: 588.235294... -> "588.2", 2.635294... -> "2.6",
+  // 1000 -> "1000". One decimal keeps the Fee row short enough to
+  // fit on one line on a phone.
+  function fmtRate(rate) {
+    if (rate === null || rate === undefined || !isFinite(rate)) return '—';
+    var r = Math.round(rate * 10) / 10;
+    return String(r);
+  }
+
   // ---------- tabs ----------
   // Each tab is its own subpage: the URL hash names it (#dashboard,
   // #transactions, #settings, #logs), so refreshing the page lands
@@ -245,11 +271,27 @@
   // ---------- bitcoin ----------
   // Pre-signed transactions: a LIST. Each has its OWN enable toggle,
   // its own label + notes, and its own release record. Adding one arms
-  // it by default — the toggle disarms it. The dry-run buttons check
+  // it by default — the toggle unarms it. The dry-run buttons check
   // the inputs are still unspent and NEVER broadcast. Notes say what
   // each tx is for, at a glance, in the list.
   var editingId = null; // id of the tx loaded into the add form, or null
   var dryRunResults = {}; // tx id -> { text, ok, verdict, spent, unknown, error }: the last dry-run result per transaction, shown in its own card. The *line* is page memory only — but a spent verdict is also recorded on the transaction server-side (a stale release record), a conflict verdict the same way (a conflict release record — a warning, not a verdict), and an own-txid verdict as a broadcast record, so the Stale / Conflict / Broadcasted status itself survives a refresh.
+  // Per-card expandable state, kept across re-renders (0.7.18):
+  // clicking a card button (Dry-run, the arm toggle, ...) reloads
+  // the list and rebuilds every card's DOM — without this map the
+  // rebuild resets each <details> to its default, so using a
+  // button would open or close the Details the user had set.
+  // Keyed by tx id; an entry exists only once the user has
+  // toggled something on that card (a fresh card uses the
+  // defaults: Details open for Active/Pending, closed for
+  // Archived; nested Inputs/Outputs closed). The render reads
+  // the map, and each <details> toggle listener writes the user's
+  // choice back into it — so a re-render restores exactly what
+  // the user left, on every card. The TXID and the Inputs/Outputs
+  // entries do not live in this map: tapping one opens a pop-out
+  // with the full info instead of expanding inline, so there is
+  // no inline state to preserve.
+  var txUiState = {};
   // The public fallback (0.7.17): a per-transaction opt-in timer on a
   // Slipstream-route transaction — if MARA has not confirmed it
   // within the chosen days, Standby broadcasts it publicly instead.
@@ -281,11 +323,6 @@
     return '(' + left + (left === 1 ? ' day' : ' days') + ' left before fallback)';
   }
   var txCardEls = {}; // tx id -> { row, sentLine }: the rendered card, so the confirmations poll can update the sent line in place
-
-  function txStats(tx) {
-    return tx.inputs + ' in / ' + tx.outputs + ' out, ' + tx.totalOutSats + ' sats out, locktime ' + tx.locktime
-      + (tx.segwit ? ', segwit' : '') + ', stored ' + fmtDate(tx.createdAt);
-  }
 
   function hostOf(u) { try { return new URL(u).host; } catch (e) { return u || ''; } }
   // One node's row — the host, plus a pill for the last test of that
@@ -369,16 +406,17 @@
     var rel = tx.release;
     if (!rel) return '';
     if (rel.status === 'broadcast') return 'Broadcast ' + fmtDate(rel.broadcastedAt) + ' via ' + methodLabel(rel.method) + '.';
-    if (rel.status === 'stale') return 'Stale — ' + (rel.error || 'inputs spent') + '. Replace the transaction to re-arm.';
+    if (rel.status === 'stale') return 'Stale — ' + (rel.error || 'inputs spent') + '.';
     // A Slipstream submission is a pseudo-pending-but-success state:
     // it went to MARA, it is not in the public mempool yet, and it
     // becomes Broadcasted once the public nodes see it — or Failed
     // if MARA drops it. The queue line (when the last status check
     // brought one back) says where it sits.
     if (rel.status === 'submitted-slipstream') {
-      var line = 'Submitted to Slipstream (MARA) ' + fmtDate(rel.submittedAt) + ' — waiting for MARA to mine it.';
-      var mara = txMaraLine(tx);
-      return mara ? line + ' ' + mara : line;
+      // The queue position lives on its own row (txMaraLine), not
+      // in this line — the card shows the submission and the queue
+      // as two rows.
+      return 'Submitted to Slipstream (MARA) ' + fmtDate(rel.submittedAt) + ' — waiting for MARA to mine it.';
     }
     return 'Failed — ' + (rel.error || 'unknown error') + '. Will retry on the next hourly check.';
   }
@@ -406,7 +444,7 @@
   // clean check clears it; a dry-run that could not reach the
   // nodes is Node Failure; a failed release is Failed; a dry-run
   // that could not say either way is Unverified; otherwise an armed
-  // tx is Ready and a disarmed one is Disabled. `settled` marks a
+  // tx is Ready and an unarmed one is Disabled. `settled` marks a
   // card whose body is collapsed and whose dry-run button is
   // disabled — a broadcasted-and-confirmed, failed, or stale
   // transaction (the Archived card). `pending` marks a card that is
@@ -417,6 +455,90 @@
   // Slipstream-pending card carries a "Broadcast publicly" escape
   // hatch. The route toggle is locked once broadcast: it appears
   // only on Active cards.
+  // The status pill carries the armed state as text ("Ready +
+  // armed", "Ready + unarmed") on an Active card — the toggle
+  // next to it is the control, green when armed. A settled or
+  // pending card has no arm state, so it keeps its plain label.
+  function txPillText(tx, st) {
+    if (st.settled || st.pending) return st.label;
+    return st.label + (tx.enabled ? ' + armed' : ' + unarmed');
+  }
+
+  // One label/value row inside a card's Details: "Label: value".
+  // The row is flex: the label is a fixed 120px column and the
+  // value takes the rest, so every row's value starts at exactly
+  // the same x — and a long value wraps inside its own column
+  // instead of running under the label. `cls` is the row's own
+  // class (tx-route, tx-fallback, ...) so a row can be found by
+  // name. Every value is sans like every other Details value
+  // (round 9 took the TXID off monospace, round 13 the Input
+  // entries — no monospace value remains). The space between
+  // label and value lives at the END of the label span: the label
+  // is sans for every row, so that space is the same width on all
+  // of them. The label's trailing space is not rendered (it sits
+  // inside the 120px column) but it is in textContent, so the row
+  // still reads "Label: value".
+  function kvRow(cls, label, value) {
+    var r = document.createElement('div');
+    r.className = 'tx-kv' + (cls ? ' ' + cls : '');
+    var k = document.createElement('span');
+    k.className = 'tx-kv-k';
+    k.textContent = label + ': ';
+    var v = document.createElement('span');
+    v.className = 'tx-kv-v';
+    v.textContent = value;
+    r.appendChild(k);
+    r.appendChild(v);
+    return r;
+  }
+
+  // One Inputs/Outputs entry row (0.7.18 round 8): a kv row like
+  // every other Details row — the label ("Input 1", "Output 1")
+  // in the 120px label column, the content on the same line in
+  // the value column. The content is truncated to one line (an
+  // ellipsis if it still does not fit) and clickable: tapping it
+  // opens a pop-out with the full info instead of expanding
+  // inline, so the card never grows or shifts. `openFn` opens
+  // that pop-out.
+  function ioEntryRow(label, shortText, valueClass, title, openFn) {
+    var r = document.createElement('div');
+    r.className = 'tx-kv tx-io-line';
+    var k = document.createElement('span');
+    k.className = 'tx-kv-k';
+    k.textContent = label + ': ';
+    var v = document.createElement('span');
+    v.className = 'tx-kv-v ' + valueClass;
+    v.textContent = shortText;
+    v.title = title;
+    v.addEventListener('click', openFn);
+    r.appendChild(k);
+    r.appendChild(v);
+    return r;
+  }
+
+  // The pop-outs for the TXID and the Inputs/Outputs entries
+  // (0.7.18 round 8): the shared showDetails pop-out (X, Close,
+  // backdrop to dismiss) with the full info in a kv list — the
+  // card itself never changes, so nothing shifts or wraps.
+  function showTxidPopout(tx) {
+    showDetails('Transaction ID', 'The full 64-character transaction ID.',
+      '<dl class="kv"><dt>TXID</dt><dd>' + escapeHtml(tx.txid) + '</dd></dl>');
+  }
+  function showInputPopout(tx, inp, i) {
+    var html = '<dl class="kv"><dt>UTXO</dt><dd>' + escapeHtml(inp.prevTxid + ':' + inp.prevVout) + '</dd>'
+      + ((inp.valueSats !== null && inp.valueSats !== undefined)
+        ? '<dt>Value</dt><dd>' + escapeHtml(fmtBtc(inp.valueSats) + ' BTC (' + fmtSats(inp.valueSats) + ' sats)') + '</dd>' : '')
+      + '</dl>';
+    showDetails('Input ' + (i + 1), 'The UTXO this input spends.', html);
+  }
+  function showOutputPopout(tx, out, i) {
+    var html = '<dl class="kv"><dt>Value</dt><dd>' + escapeHtml(fmtBtc(out.valueSats) + ' BTC (' + fmtSats(out.valueSats) + ' sats)') + '</dd>'
+      + (out.address ? '<dt>Address</dt><dd>' + escapeHtml(out.address) + '</dd>'
+        : '<dt>Type</dt><dd>' + escapeHtml(out.type) + '</dd>')
+      + '</dl>';
+    showDetails('Output ' + (i + 1), 'The full value and destination for this output.', html);
+  }
+
   function txStatus(tx) {
     var dr = dryRunResults[tx.id] || null;
     if (tx.broadcasted || (tx.release && tx.release.status === 'broadcast')) {
@@ -497,11 +619,11 @@
     // server-side), so the warning persists across refreshes — it is
     // not page memory, and no Dry-run all is needed for it to appear.
     // A settled or pending card gets no warning: its fate is already
-    // decided. The detection itself still looks at every stored
-    // transaction, because a broadcasted one is exactly why another
-    // one sharing its input can never be confirmed. Editing a
-    // transaction to spend a different input removes it from the
-    // shared set, and the warning clears on the next load.
+    // decided. The server-side detection already excludes archived
+    // transactions (round 12); the skip here is belt-and-braces for
+    // a settled or pending card. Editing a transaction to spend a
+    // different input removes it from the shared set, and the warning
+    // clears on the next load.
     var overlapsByTx = {};
     (S.bitcoin.overlaps || []).forEach(function (ov) {
       ov.txIds.forEach(function (tid) {
@@ -543,17 +665,16 @@
       var st = txStatus(tx);
       var settled = st.settled;
       var pending = st.pending;
-      // The status pill lives in the label row, top-right. The label
-      // takes the space that is left and wraps inside it, so it can
-      // never run over the pill — and the pill is in the same spot
-      // (the card's top-right corner) no matter how long the label is.
+      // Header: label (bold) + status pill, and on an Active card
+      // the arm/disarm toggle immediately to the right of the pill.
+      // The pill carries the armed state as text ("Ready + armed" /
+      // "Ready + unarmed") — the toggle is the control, green when
+      // armed. Pending and settled cards have no toggle (the tx is
+      // already out the door).
       var head = document.createElement('div');
       head.className = 'tx-head';
       var title = document.createElement('b');
       title.textContent = tx.label || 'Untitled transaction';
-      var txid = document.createElement('span');
-      txid.className = 'txid';
-      txid.textContent = tx.txid.slice(0, 16) + '…';
       var pill = document.createElement('span');
       // A warned-about tx keeps its "Ready" label but gets an amber
       // pill (0.7.16 amendment, Ryan): the tx is still ready to
@@ -566,80 +687,186 @@
       var pillCls = st.cls;
       if (pillCls === 'ok' && overlapsByTx[tx.id] && overlapsByTx[tx.id].length) pillCls = 'warn';
       pill.className = 'pill ' + pillCls;
-      pill.textContent = st.label;
-      head.appendChild(title); head.appendChild(txid); head.appendChild(pill);
-      row.appendChild(head);
-      // The arm/disarm toggle is always its own row below the label
-      // — never sharing the label row. It is gone entirely on a
-      // pending or settled card (broadcasted or stale): the tx is
-      // already out the door, so there is nothing to arm. The
-      // broadcast-route toggle goes with it — the route, like the
-      // hex, is locked once the tx is out the door (0.7.16). If the
-      // tx drops back to 'release-due' it becomes Active again and
-      // both toggles come back.
+      pill.textContent = txPillText(tx, st);
+      head.appendChild(title); head.appendChild(pill);
       if (!settled && !pending) {
-        var armRow = document.createElement('div');
-        armRow.className = 'tx-arm';
         var tog = document.createElement('label');
-        tog.className = 'switch';
+        tog.className = 'switch green';
+        tog.title = tx.enabled ? 'Armed — will broadcast at release' : 'Unarmed — will not broadcast at release';
         var cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = !!tx.enabled;
         cb.addEventListener('change', function () { toggleTx(tx.id, cb.checked); });
         var slider = document.createElement('span');
         slider.className = 'slider';
-        var state = document.createElement('span');
-        state.textContent = tx.enabled ? 'Armed' : 'Disabled';
-        tog.appendChild(cb); tog.appendChild(slider); tog.appendChild(state);
-        armRow.appendChild(tog);
-        row.appendChild(armRow);
-        // The broadcast route (0.7.16): which network this
-        // transaction goes out on. A label, not a control — the
-        // route is changed in the Edit popup, not on the card
-        // (0.7.17 follow-up: the card toggle is gone). Only the
-        // selected route is attempted, and switching it applies
-        // to the next broadcast attempt. It sits below the arm
-        // toggle, on active cards only — the route is locked
-        // once the tx is out the door.
-        var routeRow = document.createElement('div');
-        routeRow.className = 'tx-route';
-        routeRow.textContent = 'Broadcast via: ' + (tx.broadcastVia === 'slipstream' ? 'Slipstream (MARA)' : 'Public mempool');
-        row.appendChild(routeRow);
-        // The public fallback (0.7.17): a per-transaction opt-in
-        // timer, shown only while the route is Slipstream — when the
-        // route is public the setting is stored but ignored, and the
-        // row hides (it comes back if the route is switched back to
-        // Slipstream in the Edit popup). A label, not a control —
-        // the duration is changed in the Edit popup, not on the
-        // card (0.7.17 follow-up: the card select is gone).
-        if (tx.broadcastVia === 'slipstream') {
-          var fbRow = document.createElement('div');
-          fbRow.className = 'tx-fallback';
-          fbRow.textContent = 'Public Fallback: ' + fallbackLabel(tx.publicFallbackDays);
-          row.appendChild(fbRow);
+        tog.appendChild(cb); tog.appendChild(slider);
+        head.appendChild(tog);
+      }
+      row.appendChild(head);
+      // The amount, prominent below the header: the BTC figure
+      // large, the sats beside it smaller.
+      var amount = document.createElement('div');
+      amount.className = 'tx-amount';
+      var btcAmt = document.createElement('span');
+      btcAmt.textContent = fmtBtc(tx.totalOutSats) + ' BTC';
+      var satsAmt = document.createElement('span');
+      satsAmt.className = 'tx-amount-sats';
+      satsAmt.textContent = fmtSats(tx.totalOutSats) + ' sats';
+      amount.appendChild(btcAmt); amount.appendChild(satsAmt);
+      row.appendChild(amount);
+      // The Details — collapsed by default on every card (round 12:
+      // Ryan decided all cards start collapsed). Everything but the
+      // title, status, amount, and actions lives here, one
+      // label/value row per piece of info. The open state is the
+      // user's when they have toggled it (txUiState), the default
+      // otherwise — a re-render restores it instead of resetting.
+      var ui = txUiState[tx.id] || {};
+      var details = document.createElement('details');
+      details.className = 'tx-details';
+      details.open = ui.detailsOpen !== undefined ? ui.detailsOpen : false;
+      details.addEventListener('toggle', function () {
+        (txUiState[tx.id] = txUiState[tx.id] || {}).detailsOpen = details.open;
+      });
+      var sum = document.createElement('summary');
+      sum.textContent = 'Details';
+      details.appendChild(sum);
+      row.appendChild(details);
+      var body = details;
+      // The Inputs and Outputs (0.7.18 refinement): a drop-down
+      // only when there is more than one entry on that side —
+      // with exactly one input (or output) there is no drop-down
+      // at all, just the single entry as a normal kv row inline
+      // (round 10). Each drop-down is collapsed by default, its
+      // summary shows only its count — no BTC amount in a summary
+      // — and expanding one lists every entry as a kv row
+      // (round 8): the label ("Input 1", "Output 1") in the 120px
+      // label column, the content on the same line in the value
+      // column, left-aligned with every other Details value. The
+      // content is truncated to one line and clickable — tapping
+      // it opens a pop-out with the full info instead of expanding
+      // inline. Inputs list each input's outpoint (and its value
+      // when known); Outputs list each output's value and
+      // destination address (or its script type when no address
+      // can be derived). The detail comes from the server (GET
+      // /api/state derives it from the stored hex); without it
+      // the rows fall back to the plain counts.
+      var io = tx.detail;
+      if (io && Array.isArray(io.inputs) && Array.isArray(io.outputs)) {
+        if (io.inputs.length === 1) {
+          var inp0 = io.inputs[0];
+          var shortIn = shortInput(inp0.prevTxid + ':' + inp0.prevVout) + '…'
+            + ((inp0.valueSats !== null && inp0.valueSats !== undefined) ? ' · ' + fmtBtc(inp0.valueSats) + ' BTC' : '');
+          body.appendChild(ioEntryRow('Input', shortIn, 'tx-io-value', 'Click to show full input', function () { showInputPopout(tx, inp0, 0); }));
+        } else {
+          var inDet = document.createElement('details');
+          inDet.className = 'tx-io';
+          inDet.open = ui.inputsOpen === true;
+          inDet.addEventListener('toggle', function () {
+            (txUiState[tx.id] = txUiState[tx.id] || {}).inputsOpen = inDet.open;
+          });
+          var inSum = document.createElement('summary');
+          inSum.textContent = 'Inputs: ' + tx.inputs;
+          inDet.appendChild(inSum);
+          io.inputs.forEach(function (inp, i) {
+            var shortText = shortInput(inp.prevTxid + ':' + inp.prevVout) + '…'
+              + ((inp.valueSats !== null && inp.valueSats !== undefined) ? ' · ' + fmtBtc(inp.valueSats) + ' BTC' : '');
+            inDet.appendChild(ioEntryRow('Input ' + (i + 1), shortText, 'tx-io-value', 'Click to show full input', function () { showInputPopout(tx, inp, i); }));
+          });
+          body.appendChild(inDet);
+        }
+        if (io.outputs.length === 1) {
+          var out0 = io.outputs[0];
+          var shortOut = fmtBtc(out0.valueSats) + ' BTC (' + fmtSats(out0.valueSats) + ' sats)'
+            + (out0.address ? ' → ' + out0.address.slice(0, 12) + '…' : ' · ' + out0.type);
+          body.appendChild(ioEntryRow('Output', shortOut, 'tx-io-value', 'Click to show full output', function () { showOutputPopout(tx, out0, 0); }));
+        } else {
+          var outDet = document.createElement('details');
+          outDet.className = 'tx-io';
+          outDet.open = ui.outputsOpen === true;
+          outDet.addEventListener('toggle', function () {
+            (txUiState[tx.id] = txUiState[tx.id] || {}).outputsOpen = outDet.open;
+          });
+          var outSum = document.createElement('summary');
+          outSum.textContent = 'Outputs: ' + tx.outputs;
+          outDet.appendChild(outSum);
+          io.outputs.forEach(function (out, i) {
+            var shortText = fmtBtc(out.valueSats) + ' BTC (' + fmtSats(out.valueSats) + ' sats)'
+              + (out.address ? ' → ' + out.address.slice(0, 12) + '…' : ' · ' + out.type);
+            outDet.appendChild(ioEntryRow('Output ' + (i + 1), shortText, 'tx-io-value', 'Click to show full output', function () { showOutputPopout(tx, out, i); }));
+          });
+          body.appendChild(outDet);
+        }
+      } else {
+        body.appendChild(kvRow('', 'Inputs', String(tx.inputs)));
+        body.appendChild(kvRow('', 'Outputs', String(tx.outputs)));
+      }
+      // The fee (0.7.18): stored at add time when the node could
+      // answer the parent lookup. The row hides entirely when the
+      // fee is unknown — no "—" fee. The row uses the standard
+      // 120px label column like every other Details row (round 7),
+      // so its value starts exactly where the others' do. The
+      // value drops the redundant "sats" — the rate's "sat/vB"
+      // carries the unit — so even a 50,000-sat fee fits on one
+      // line in the 162px left after the column on a phone.
+      if (tx.feeSats !== null && tx.feeSats !== undefined) {
+        body.appendChild(kvRow('tx-fee', 'Fee', fmtSats(tx.feeSats) + ' · ' + fmtRate(tx.feeRateSatVb) + ' sat/vB'));
+      }
+      // The TXID, truncated — clickable to open a pop-out with the
+      // full 64-hex value (0.7.18 round 8: it used to expand inline,
+      // which grew the card and wrapped the hex under the label;
+      // the pop-out leaves the card exactly as it is). A display
+      // action only: it changes nothing about the tx. The pointer
+      // cursor and the title say it is clickable.
+      var txidRow = document.createElement('div');
+      txidRow.className = 'tx-kv tx-txid';
+      var txidK = document.createElement('span');
+      txidK.className = 'tx-kv-k';
+      txidK.textContent = 'TXID: ';
+      var txidV = document.createElement('span');
+      txidV.className = 'tx-kv-v tx-txid-value';
+      txidV.textContent = tx.txid.slice(0, 16) + '…';
+      txidV.title = 'Click to show full TXID';
+      txidV.addEventListener('click', function () { showTxidPopout(tx); });
+      txidRow.appendChild(txidK);
+      txidRow.appendChild(txidV);
+      body.appendChild(txidRow);
+      body.appendChild(kvRow('tx-route', 'Broadcast via', tx.broadcastVia === 'slipstream' ? 'Slipstream (MARA)' : 'Public mempool'));
+      // The public fallback (0.7.17): a per-transaction opt-in
+      // timer, shown only while the route is Slipstream AND a
+      // fallback is set — when the route is public the setting is
+      // stored but ignored, and when it is Never there is nothing
+      // to show. On a Slipstream-pending card the countdown rides
+      // on the same row. The duration is changed in the Edit popup,
+      // not on the card. Changing it only moves the deadline: it is
+      // counted from when MARA first received the transaction, and
+      // setting it sooner or later does not change the count.
+      if (tx.broadcastVia === 'slipstream' && tx.publicFallbackDays !== null && tx.publicFallbackDays !== undefined) {
+        var fbText = fallbackLabel(tx.publicFallbackDays);
+        if (pending && tx.release && tx.release.status === 'submitted-slipstream') {
+          fbText += ' ' + fallbackCountdown(tx);
+        } else if (!pending && !settled) {
+          // Not yet broadcast (Active): the duration runs from the
+          // broadcast, not from now — "7 days from broadcast".
+          fbText += ' from broadcast';
+        }
+        body.appendChild(kvRow('tx-fallback', 'Public Fallback', fbText));
+      }
+      if (tx.locktime > 0) {
+        body.appendChild(kvRow('', 'Locktime', String(tx.locktime)));
+      }
+      body.appendChild(kvRow('', 'Created', fmtDate(tx.createdAt)));
+      // The MARA queue line for a Slipstream-pending card: where
+      // it sits in MARA's queue and how likely it is to be mined
+      // soon. Its own row, not folded into the submission line.
+      if (pending && tx.release && tx.release.status === 'submitted-slipstream') {
+        var mara = txMaraLine(tx);
+        if (mara) {
+          var maraLine = document.createElement('p');
+          maraLine.className = 'tx-mara';
+          maraLine.textContent = mara;
+          body.appendChild(maraLine);
         }
       }
-      // A settled or pending transaction hides everything but its
-      // label and status into a collapsible, collapsed by default
-      // (the Pending card takes the archived-card format). The
-      // action buttons stay outside it — with dry-run disabled, and
-      // Broadcast Now disabled too (the tx is already out the door).
-      // Edit stays available on both (label and notes only — the
-      // hex field is disabled in edit mode for these).
-      var details = null, body = row;
-      if (settled || pending) {
-        details = document.createElement('details');
-        details.className = 'tx-details';
-        var sum = document.createElement('summary');
-        sum.textContent = 'Details';
-        details.appendChild(sum);
-        row.appendChild(details);
-        body = details;
-      }
-      var stats = document.createElement('p');
-      stats.className = 'muted';
-      stats.textContent = txStats(tx);
-      body.appendChild(stats);
       if (tx.notes) {
         var notes = document.createElement('p');
         notes.className = 'tx-notes';
@@ -653,22 +880,6 @@
         rel.textContent = txReleaseLine(tx);
         body.appendChild(rel);
         if (tx.broadcasted) sentLine = rel;
-      }
-      // The public fallback on a Slipstream-pending card (0.7.17):
-      // a plain-text line — the duration and the countdown to the
-      // deadline, side by side. The duration is changed in the
-      // Edit popup, not on the card (0.7.17 follow-up: the card
-      // select is gone, and with it the tooltip and the note that
-      // used to sit under it — the deadline warning now lives in
-      // the Edit popup only). Changing the duration only moves the
-      // deadline: it is counted from when MARA first received the
-      // transaction, and setting it sooner or later does not change
-      // the count. It does not re-send anything.
-      if (pending && tx.release && tx.release.status === 'submitted-slipstream') {
-        var fbRowP = document.createElement('div');
-        fbRowP.className = 'tx-fallback';
-        fbRowP.textContent = 'Public Fallback: ' + fallbackLabel(tx.publicFallbackDays) + ' ' + fallbackCountdown(tx);
-        body.appendChild(fbRowP);
       }
       var actions = document.createElement('div');
       actions.className = 'tx-actions';
@@ -765,22 +976,26 @@
         // pill), never green and never red. Keyed off the verdict,
         // not wouldBroadcast — the release WILL attempt the
         // broadcast, so wouldBroadcast is true here, and the line
-        // must not read as 'ready'.
+        // must not read as 'ready'. The line lives BELOW the buttons
+        // (0.7.18 refinement, as in 0.7.17) — never inside the
+        // Details, so it is visible without expanding anything.
         dryLine.className = dr.verdict === 'timelocked' ? 'tx-dryrun tx-warn' : 'tx-dryrun muted';
         dryLine.textContent = dr.text;
-        body.appendChild(dryLine);
+        row.appendChild(dryLine);
       }
       // Shared-input warnings from the state (see renderBitcoin):
       // this tx spends an input another stored tx also spends, so
       // only one of them can ever be confirmed. The input is shown
-      // short so the line cannot overflow the card.
+      // short so the line cannot overflow the card. Like the
+      // dry-run line, warnings live BELOW the buttons (0.7.18
+      // refinement, as in 0.7.17) — never inside the Details.
       var ow = overlapsByTx[tx.id];
       if (ow && ow.length) {
         ow.forEach(function (w) {
           var warnLine = document.createElement('p');
           warnLine.className = 'tx-warn';
           warnLine.textContent = 'Warning: shares input ' + shortInput(w.input) + ' with ' + w.others + ' — only one of them can ever be confirmed.';
-          body.appendChild(warnLine);
+          row.appendChild(warnLine);
         });
       }
       txCardEls[tx.id] = { row: row, sentLine: sentLine, pill: pill };
@@ -810,7 +1025,7 @@
   async function toggleTx(id, enabled) {
     try {
       await api('PUT', '/api/bitcoin/txs/' + encodeURIComponent(id), { enabled: enabled });
-      setMsg($('btc-msg'), enabled ? 'Transaction armed.' : 'Transaction disarmed.', true);
+      setMsg($('btc-msg'), enabled ? 'Transaction armed.' : 'Transaction unarmed.', true);
       await load();
     } catch (e) { setMsg($('btc-msg'), e.message, false); await load(); }
   }
@@ -1080,7 +1295,7 @@
       var fbVal = $('btc-fallback').value;
       var body = { txHex: hex, label: $('btc-label').value, notes: $('btc-notes').value, broadcastVia: $('btc-route').value, publicFallbackDays: fbVal === '' ? null : parseInt(fbVal, 10) };
       var r = await api('POST', '/api/bitcoin/txs', body);
-      setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to disarm it.', true);
+      setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to unarm it.', true);
       $('btc-label').value = '';
       $('btc-notes').value = '';
       $('btc-hex').value = '';
@@ -1306,20 +1521,22 @@
       'Broadcast publicly — I understand');
   }
 
-  // Broadcast All: the transactions NOT in the Archived or Pending
-  // Transactions cards (broadcasted, stale, or still waiting for a
-  // confirmation), each through the same path. The dialog names the
-  // count — and once the owner proceeds, a status pop-out says what
-  // is being attempted and then what completed, one line per
-  // transaction, so a mixed result (one broadcast, one stale) is
-  // legible instead of a single aggregate line. The pop-out stays
-  // open until the owner closes it; closing it mid-run leaves it
-  // closed and lets the aggregate line below the buttons speak.
-  // The archived and pending ones are never attempted or counted:
-  // their ids are not sent, and the server skips them too. A
-  // Slipstream-pending tx is never broadcast publicly by Broadcast
-  // All — the public escape hatch is a separate manual button on
-  // its card.
+  // Broadcast All (round 12, revised): two separate buttons on the
+  // main card — "Broadcast all" and "Broadcast armed" — each with
+  // its own confirmation dialog. "Broadcast all" sends every
+  // unbroadcasted transaction including unarmed ones; "Broadcast
+  // armed" sends only the armed ones; Cancel sends nothing. Each
+  // dialog names the count, and once the owner proceeds, a status
+  // pop-out says what is being attempted and then what completed,
+  // one line per transaction, so a mixed result (one broadcast, one
+  // stale) is legible instead of a single aggregate line. The
+  // pop-out stays open until the owner closes it; closing it
+  // mid-run leaves it closed and lets the aggregate line below the
+  // buttons speak. The archived and pending ones are never
+  // attempted or counted: their ids are not sent, and the server
+  // skips them too. A Slipstream-pending tx is never broadcast
+  // publicly by Broadcast All — the public escape hatch is a
+  // separate manual button on its card.
   async function broadcastAll() {
     var pending = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
     if (!pending.length) {
@@ -1331,39 +1548,78 @@
       return;
     }
     showConfirm('Broadcast all transactions?',
-      'This will broadcast ' + pending.length + ' transaction(s) for real — the funds move and it cannot be undone. This will send all armed and disarmed transactions. Each one is checked first (a stale one is skipped, not sent) and broadcasts via the primary node, falling back to the secondary if the primary does not answer.',
-      async function () {
-        var names = pending.map(function (t) { return t.label || 'Untitled transaction'; });
-        showDetails('Broadcasting all transactions',
-          'Attempting to broadcast ' + pending.length + ' transaction(s)…',
-          '<ul class="plain-list">' + names.map(function (n) {
-            return '<li>' + escapeHtml(n) + ' — pending…</li>';
-          }).join('') + '</ul>');
-        try {
-          var r = await api('POST', '/api/broadcast/all', { ids: pending.map(function (t) { return t.id; }) });
-          var sent = (r.results || []).filter(function (x) { return x.action === 'broadcast'; }).length;
-          var stale = (r.results || []).filter(function (x) { return x.action === 'stale'; }).length;
-          var failed = (r.results || []).filter(function (x) { return x.action === 'failed'; }).length;
-          var summary = 'Broadcast all: ' + sent + ' broadcast' + (stale ? ', ' + stale + ' stale' : '') + (failed ? ', ' + failed + ' failed' : '') + '.';
-          setMsg($('btc-all-msg'), summary, failed === 0);
-          await load();
-          await refreshConfirmations();
-          if ($('confirm-modal').classList.contains('open')) {
-            showDetails('Broadcast all — ' + (failed ? 'finished with failures' : 'complete'),
-              summary,
-              '<ul class="plain-list">' + (r.results || []).map(function (x) {
-                return '<li>' + escapeHtml(x.label || 'Untitled transaction') + ' — ' + escapeHtml(broadcastResultText(x)) + '</li>';
-              }).join('') + '</ul>');
-          }
-        } catch (e) {
-          setMsg($('btc-all-msg'), e.message, false);
-          if ($('confirm-modal').classList.contains('open')) showDetails('Broadcast all — failed', e.message, '');
-        }
-      },
+      'This will broadcast for real — the funds move and it cannot be undone. This sends all ' + pending.length + ' unbroadcasted transaction(s), including unarmed ones. Each one is checked first (a stale one is skipped, not sent) and broadcasts via the primary node, falling back to the secondary if the primary does not answer.',
+      function () { runBroadcastAll(pending, false, 'Broadcast all'); },
       'Broadcast — I understand');
   }
 
+  // Broadcast Armed: the same path as Broadcast All, but only the
+  // armed unbroadcasted transactions — the unarmed ones are left
+  // alone. The armed-only filter is applied client-side (which ids
+  // are sent) AND server-side (the armedOnly flag), so a stale or
+  // disarmed id in the request is still never broadcast.
+  async function broadcastArmed() {
+    var pending = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
+    if (!pending.length) {
+      setMsg($('btc-all-msg'),
+        (S.bitcoin.txs || []).length
+          ? 'Nothing to broadcast — every transaction is already archived or pending.'
+          : 'Nothing to broadcast — no transactions stored.',
+        true);
+      return;
+    }
+    var armed = pending.filter(function (t) { return t.enabled; });
+    if (!armed.length) {
+      setMsg($('btc-all-msg'), 'Nothing to broadcast — no armed transactions to broadcast.', true);
+      return;
+    }
+    showConfirm('Broadcast armed transactions?',
+      'This will broadcast for real — the funds move and it cannot be undone. This sends only the ' + armed.length + ' armed transaction(s); unarmed ones are left alone. Each one is checked first (a stale one is skipped, not sent) and broadcasts via the primary node, falling back to the secondary if the primary does not answer.',
+      function () { runBroadcastAll(armed, true, 'Broadcast armed'); },
+      'Broadcast — I understand');
+  }
+
+  // The actual Broadcast All run, shared by both buttons: the same
+  // progress pop-out, the same POST (armedOnly only for the armed
+  // button), the same per-transaction results. Nothing is broadcast
+  // until the owner confirms in the dialog.
+  async function runBroadcastAll(targets, armedOnly, label) {
+    if (!targets.length) {
+      setMsg($('btc-all-msg'), 'Nothing to broadcast — no armed transactions to broadcast.', true);
+      return;
+    }
+    var names = targets.map(function (t) { return t.label || 'Untitled transaction'; });
+    showDetails(label + ' — broadcasting',
+      'Attempting to broadcast ' + targets.length + ' transaction(s)…',
+      '<ul class="plain-list">' + names.map(function (n) {
+        return '<li>' + escapeHtml(n) + ' — pending…</li>';
+      }).join('') + '</ul>');
+    try {
+      var body = { ids: targets.map(function (t) { return t.id; }) };
+      if (armedOnly) body.armedOnly = true;
+      var r = await api('POST', '/api/broadcast/all', body);
+      var sent = (r.results || []).filter(function (x) { return x.action === 'broadcast'; }).length;
+      var stale = (r.results || []).filter(function (x) { return x.action === 'stale'; }).length;
+      var failed = (r.results || []).filter(function (x) { return x.action === 'failed'; }).length;
+      var summary = label + ': ' + sent + ' broadcast' + (stale ? ', ' + stale + ' stale' : '') + (failed ? ', ' + failed + ' failed' : '') + '.';
+      setMsg($('btc-all-msg'), summary, failed === 0);
+      await load();
+      await refreshConfirmations();
+      if ($('confirm-modal').classList.contains('open')) {
+        showDetails(label + ' — ' + (failed ? 'finished with failures' : 'complete'),
+          summary,
+          '<ul class="plain-list">' + (r.results || []).map(function (x) {
+            return '<li>' + escapeHtml(x.label || 'Untitled transaction') + ' — ' + escapeHtml(broadcastResultText(x)) + '</li>';
+          }).join('') + '</ul>');
+      }
+    } catch (e) {
+      setMsg($('btc-all-msg'), e.message, false);
+      if ($('confirm-modal').classList.contains('open')) showDetails(label + ' — failed', e.message, '');
+    }
+  }
+
   $('btn-btc-broadcast-all').addEventListener('click', broadcastAll);
+  $('btn-btc-broadcast-armed').addEventListener('click', broadcastArmed);
 
   $('btn-btc-test-all').addEventListener('click', async function () {
     var before = inactiveIds();

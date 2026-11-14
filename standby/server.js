@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.17';
+const VERSION = '0.7.18';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -1227,6 +1227,15 @@ async function handleApi(req, res, pathname) {
     mergeExternalCheckin(state, now);
     const served = sanitizeState(state);
     served.bitcoin.overlaps = bitcoin.findSharedInputs(state.bitcoin.txs || []);
+    // The inputs/outputs detail (0.7.18 refinement): derived from
+    // the stored hexes on every read, like the overlaps — never
+    // stored, so no migration and no restore change. An unparseable
+    // hex (defensive only — adds and restores validate) gets no
+    // detail, and the card falls back to the plain counts.
+    for (const t of served.bitcoin.txs || []) {
+      try { t.detail = bitcoin.txIoDetail(bitcoin.parseTx(t.hex)); }
+      catch { t.detail = null; }
+    }
     return sendJson(res, 200, served);
   }
 
@@ -1420,6 +1429,13 @@ async function handleApi(req, res, pathname) {
   // deadline anchor for a tx whose submit keeps failing. It is set
   // by broadcastOneInner, never by the client, and never overwritten
   // once set.
+  // feeSats / feeRateSatVb (0.7.18) are the transaction fee in
+  // satoshis and the fee rate in sat/vB, computed from the parent
+  // txs on the node at add time (and refreshed by a dry-run, and
+  // recomputed at startup — see recomputeStoredFees).
+  // null when the parents could not be fetched — the fee is
+  // display-only, never a gate, so an unknown fee never blocks an
+  // add.
   function newTxRecord(parsed, hex, label, notes, broadcastVia, publicFallbackDays) {
     return {
       id: store.newTxId(),
@@ -1431,6 +1447,8 @@ async function handleApi(req, res, pathname) {
       inputs: parsed.inputs.length,
       outputs: parsed.outputs.length,
       totalOutSats: parsed.totalOutSats,
+      feeSats: null,
+      feeRateSatVb: null,
       locktime: parsed.locktime,
       segwit: parsed.segwit,
       enabled: true, // new transactions are armed by default
@@ -1443,6 +1461,14 @@ async function handleApi(req, res, pathname) {
       // confirmations, blockHeight, found, checkedAt }.
       broadcasted: null,
     };
+  }
+  // The fee for a parsed tx, best-effort (0.7.18): null when the
+  // node cannot answer (unknown parent, unreachable node). Never
+  // throws — an add must never fail because the fee could not be
+  // computed.
+  async function feeFor(parsed) {
+    try { return await bitcoin.computeFee(parsed, bitcoin.endpointsFor(state.settings)); }
+    catch { return null; }
   }
   // A transaction is identified by its txid: the same on-chain
   // transaction stored twice is two cards, both armed, for one
@@ -1480,6 +1506,8 @@ async function handleApi(req, res, pathname) {
     const dupErr = duplicateTx(parsed.txid);
     if (dupErr) return sendError(res, 400, dupErr);
     const tx = newTxRecord(parsed, hex, body.label, body.notes, body.broadcastVia, body.publicFallbackDays);
+    const fee = await feeFor(parsed);
+    if (fee) { tx.feeSats = fee.feeSats; tx.feeRateSatVb = fee.feeRateSatVb; }
     state.bitcoin.txs.push(tx);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 201, { tx });
@@ -1542,6 +1570,8 @@ async function handleApi(req, res, pathname) {
     const dupErr = duplicateTx(parsed.txid);
     if (dupErr) return sendError(res, 400, dupErr);
     const tx = newTxRecord(parsed, hex, body.label, body.notes, body.broadcastVia, body.publicFallbackDays);
+    const fee = await feeFor(parsed);
+    if (fee) { tx.feeSats = fee.feeSats; tx.feeRateSatVb = fee.feeRateSatVb; }
     state.bitcoin.txs.push(tx);
     store.saveState(DATA_DIR, state);
     return sendJson(res, 201, { tx });
@@ -1585,6 +1615,12 @@ async function handleApi(req, res, pathname) {
         tx.inputs = parsed.inputs.length;
         tx.outputs = parsed.outputs.length;
         tx.totalOutSats = parsed.totalOutSats;
+        // A replaced hex is a different transaction: its fee is
+        // recomputed from the new inputs (best-effort, null when
+        // the parents cannot be fetched).
+        const fee = await feeFor(parsed);
+        tx.feeSats = fee ? fee.feeSats : null;
+        tx.feeRateSatVb = fee ? fee.feeRateSatVb : null;
         tx.locktime = parsed.locktime;
         tx.segwit = parsed.segwit;
         // A replaced hex is a different transaction: the broadcasted fact
@@ -1676,8 +1712,12 @@ async function handleApi(req, res, pathname) {
   // Each is broadcast through the same path (freshness gate, then primary
   // with secondary fallback); a stale or failed tx does not stop the
   // others. The UI asks first (a confirmation dialog).
+  // Body { armedOnly: true } (round 12) sends only the armed
+  // (enabled) transactions — a disarmed id in the list is skipped,
+  // not sent. The broadcast guards are the same either way.
   if (req.method === 'POST' && pathname === '/api/broadcast/all') {
     const body = await readBody(req).catch(() => ({}));
+    const armedOnly = !!(body && body.armedOnly);
     const txs = state.bitcoin.txs || [];
     if (!txs.length) return sendError(res, 400, 'no transactions stored — paste a signed transaction hex first');
     let targets;
@@ -1695,7 +1735,8 @@ async function handleApi(req, res, pathname) {
       targets = txs.filter((t) => !t.broadcasted && !(t.release && t.release.status === 'stale')
         && !(t.release && t.release.status === 'submitted-slipstream'));
     }
-    if (!targets.length) return sendError(res, 400, 'nothing to broadcast — every transaction is already archived or pending');
+    if (armedOnly) targets = targets.filter((t) => t.enabled);
+    if (!targets.length) return sendError(res, 400, armedOnly ? 'nothing to broadcast — no armed transactions to broadcast' : 'nothing to broadcast — every transaction is already archived or pending');
     const endpoints = bitcoin.endpointsFor(state.settings);
     const results = [];
     for (const tx of targets) {
@@ -1821,6 +1862,13 @@ async function handleApi(req, res, pathname) {
         inputs: parsed.inputs.length,
         outputs: parsed.outputs.length,
         totalOutSats: parsed.totalOutSats,
+        // The fee (0.7.18): carried through when present (a number
+        // or null); a backup from before 0.7.18 carries no fee,
+        // which restores as null — the same as an older record
+        // loaded from disk. A negative or non-finite value is not
+        // believed either.
+        feeSats: (typeof t.feeSats === 'number' && Number.isFinite(t.feeSats) && t.feeSats >= 0) ? t.feeSats : null,
+        feeRateSatVb: (typeof t.feeRateSatVb === 'number' && Number.isFinite(t.feeRateSatVb) && t.feeRateSatVb >= 0) ? t.feeRateSatVb : null,
         locktime: parsed.locktime,
         segwit: parsed.segwit,
         enabled: typeof t.enabled === 'boolean' ? t.enabled : true,
@@ -1974,9 +2022,22 @@ async function handleApi(req, res, pathname) {
     // by bitcoin.dryRun) already records the run itself, so no second
     // log entry is written here.
     let verdictRecorded = false;
+    let feeBackfilled = false;
     for (const r of results) {
       const tx = txs.find((t) => t.id === r.id);
       if (!tx || tx.broadcasted) continue;
+      // The fee (0.7.18): a dry-run OVERWRITES the stored fee with
+      // the freshly computed one — the input values were fetched
+      // from the node for the freshness check anyway. A fee stored
+      // wrong (e.g. by the units bug, which read the parent value
+      // as BTC) self-corrects on the next dry-run instead of
+      // lingering; a null result (the node could not answer) leaves
+      // the stored fee alone.
+      if (r.fee && typeof r.fee.feeSats === 'number') {
+        if (tx.feeSats !== r.fee.feeSats || tx.feeRateSatVb !== r.fee.feeRateSatVb) feeBackfilled = true;
+        tx.feeSats = r.fee.feeSats;
+        tx.feeRateSatVb = (typeof r.fee.feeRateSatVb === 'number') ? r.fee.feeRateSatVb : null;
+      }
       if (r.spent && r.spent.length) {
         if (tx.release && tx.release.status === 'stale') continue;
         const spentDesc = r.spent.map((i) => String(i.prevTxid || '').slice(0, 12) + ':' + i.prevVout).join(', ');
@@ -2020,7 +2081,7 @@ async function handleApi(req, res, pathname) {
         verdictRecorded = true;
       }
     }
-    if (verdictRecorded) store.saveState(DATA_DIR, state);
+    if (verdictRecorded || feeBackfilled) store.saveState(DATA_DIR, state);
     const armed = results.filter((r) => r.enabled);
     // 'would broadcast' counts the transactions that would actually
     // land: a timelocked transaction is attempted (its per-result
@@ -2040,10 +2101,10 @@ async function handleApi(req, res, pathname) {
     // Dry-run all also checks that no input is spent by two stored
     // transactions: only one of them can ever be confirmed, so the shared
     // input is flagged on both cards. A single dry-run does not run
-    // this check — it is a property of the whole list. The check still
-    // looks at every stored transaction (a broadcasted one is exactly
-    // why another one can never be confirmed); the client only warns the
-    // cards that are not already settled.
+    // this check — it is a property of the whole list. Archived
+    // transactions are excluded from the check (round 12): their fate
+    // is decided, so a live transaction sharing an input with an
+    // archived one is not warned about it.
     const overlaps = body && body.id ? [] : bitcoin.findSharedInputs(state.bitcoin.txs || []);
     const overlapNote = overlaps.length
       ? ' Warning: ' + overlaps.length + ' input(s) are shared across transactions — only one transaction per shared input can ever be confirmed: '
@@ -2061,6 +2122,50 @@ async function handleApi(req, res, pathname) {
   }
 
   return sendError(res, 404, 'unknown API route');
+}
+
+// Stored fees self-correct at startup (0.7.18, fee units fix): a
+// fee stored wrong — e.g. by the pre-fix code, which read the
+// parent vout value as BTC and multiplied by 1e8 — is recomputed
+// from the node and overwritten, so a wrong fee displays correct
+// after the next restart with nobody re-adding the tx. A fee the
+// node cannot recompute (unknown parent, unreachable node) is left
+// alone: null means "unknown", never "zero", so a failed lookup
+// must not wipe a stored fee — and a stored fee is only overwritten
+// when the recompute returns a value. Runs in the background
+// shortly after startup; never throws; saves only when something
+// changed. The fresh state is reloaded just before saving, so a
+// release tick that saved in the meantime is not clobbered.
+async function recomputeStoredFees() {
+  try {
+    const st = store.loadState(DATA_DIR);
+    const txs = st.bitcoin.txs || [];
+    if (!txs.length) return;
+    const endpoints = bitcoin.endpointsFor(st.settings);
+    const fresh = await Promise.all(txs.map(async (tx) => {
+      try {
+        const fee = await bitcoin.computeFee(bitcoin.parseTx(tx.hex), endpoints);
+        return { id: tx.id, fee };
+      } catch { return { id: tx.id, fee: null }; }
+    }));
+    const computed = fresh.filter((f) => f.fee && typeof f.fee.feeSats === 'number');
+    if (!computed.length) return;
+    const st2 = store.loadState(DATA_DIR);
+    let any = false;
+    for (const f of computed) {
+      const tx = (st2.bitcoin.txs || []).find((t) => t.id === f.id);
+      if (!tx) continue;
+      if (tx.feeSats !== f.fee.feeSats || tx.feeRateSatVb !== f.fee.feeRateSatVb) {
+        tx.feeSats = f.fee.feeSats;
+        tx.feeRateSatVb = (typeof f.fee.feeRateSatVb === 'number') ? f.fee.feeRateSatVb : null;
+        any = true;
+      }
+    }
+    if (any) {
+      store.saveState(DATA_DIR, st2);
+      console.log('startup fee recompute: corrected stored fee(s)');
+    }
+  } catch (e) { console.error('startup fee recompute failed:', e); }
 }
 
 const server = http.createServer((req, res) => {
@@ -2082,5 +2187,8 @@ server.listen(PORT, '0.0.0.0', () => {
 });
 
 // Release-evaluation timer: hourly, plus once shortly after startup.
+// The startup fee recompute runs on the same schedule (once, shortly
+// after startup) — see recomputeStoredFees.
 setTimeout(runReleaseTick, 5000);
+setTimeout(recomputeStoredFees, 5000);
 setInterval(runReleaseTick, 60 * 60 * 1000);

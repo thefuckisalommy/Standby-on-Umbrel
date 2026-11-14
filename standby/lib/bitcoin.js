@@ -163,7 +163,7 @@ function readVarint(buf, off) {
 
 // Parse a raw signed transaction (legacy or segwit) and compute its txid.
 // Throws on anything that is not a well-formed transaction. Returns:
-// { txid, version, segwit, inputs, outputs, totalOutSats, locktime, size }
+// { txid, version, segwit, inputs, outputs, totalOutSats, locktime, size, vsize }
 function parseTx(hex) {
   if (typeof hex !== 'string' || !/^[0-9a-fA-F]+$/.test(hex)) {
     throw new Error('transaction must be a hex string');
@@ -252,6 +252,12 @@ function parseTx(hex) {
     totalOutSats: totalOut.toString(),
     locktime,
     size: buf.length,
+    // vsize: the size the fee rate is computed against. For a
+    // non-segwit transaction it is the serialized size; for a
+    // segwit one it is ceil((3 * base_size + total_size) / 4),
+    // where base_size is the serialization without marker, flag,
+    // or witness data (the `stripped` buffer above).
+    vsize: segwit ? Math.ceil((3 * stripped.length + buf.length) / 4) : buf.length,
   };
 }
 
@@ -643,7 +649,7 @@ function requestText({ protocol, hostname, port, path: p, method, headers, body,
   });
 }
 
-function mempoolReq(path, method, body, base) {
+function mempoolReq(path, method, body, base, timeoutMs) {
   const u = new URL(base || DEFAULT_PUBLIC_API_URL);
   return requestText({
     protocol: u.protocol,
@@ -653,6 +659,7 @@ function mempoolReq(path, method, body, base) {
     method: method || 'GET',
     headers: body !== undefined ? { 'Content-Type': 'text/plain' } : {},
     body,
+    timeoutMs,
   });
 }
 
@@ -723,10 +730,10 @@ async function broadcastViaApi(hex, txid, apiBase) {
 //   Fee floor: the minimum submission rate is the higher of 2x the
 //     current mempool priority fee rate or 2 sat/vB (GET
 //     /api/block-info returns submit_fee_rate). There is deliberately
-//     NO local fee-rate pre-check here — computing the fee rate needs
-//     the input values, which this app does not fetch; the submission
-//     is attempted and Slipstream's rejection reason is surfaced if
-//     the fee is too low.
+//     NO local fee-rate pre-check here — the fee is computed for
+//     display (0.7.18), not as a gate; the submission is attempted
+//     and Slipstream's rejection reason is surfaced if the fee is
+//     too low.
 // ---------------------------------------------------------------------------
 const DEFAULT_SLIPSTREAM_API_URL = 'https://slipstream.mara.com';
 
@@ -1005,6 +1012,13 @@ async function dryRun(dataDir, { tx, endpoints }) {
           : verdict === 'conflict'
           ? check.conflict.length + ' input(s) are spent by another transaction that is not confirmed yet — the spend may still be evicted, so this transaction stays active with a warning and ' + attempt + ' will still be attempted. ' + viaNote
           : check.unknown.length + ' input(s) could not be verified — ' + attempt + ' would be attempted, but the network is the arbiter. ' + viaNote;
+  // The fee (0.7.18): the input values come from the parent txs,
+  // fetched best-effort from the node. Always computed fresh — the
+  // caller (the dry-run endpoint) overwrites the stored fee with
+  // it, so a fee stored wrong (e.g. by the units bug, which read
+  // the parent value as BTC) self-corrects on the next dry-run
+  // instead of lingering. dryRun itself only returns it.
+  const fee = await computeFee(parsed, endpoints);
   appendBroadcastLog(dataDir, {
     ts: new Date().toISOString(),
     kind: 'dry-run',
@@ -1027,6 +1041,7 @@ async function dryRun(dataDir, { tx, endpoints }) {
     broadcastVia: tx.broadcastVia === 'slipstream' ? 'slipstream' : 'public',
     timelockedUntil: timelock.timelocked ? (timelock.until instanceof Date ? timelock.until.toISOString() : timelock.until) : null,
     txid: tx.txid,
+    fee,
     checked: check.checked,
     checkedVia: check.checkedVia,
     checkedBase: check.checkedBase,
@@ -1087,11 +1102,225 @@ async function broadcastTx(dataDir, { hex, txid, endpoints, notePrefix }) {
 //   200 { status: { confirmed, block_height, block_time, ... } }
 //   404 = the network does not know this transaction (never seen, or
 //     dropped from the mempool).
-async function mempoolTxStatus(txid, apiBase) {
-  const res = await mempoolReq('/api/tx/' + txid, 'GET', undefined, apiBase);
+async function mempoolTxStatus(txid, apiBase, timeoutMs) {
+  const res = await mempoolReq('/api/tx/' + txid, 'GET', undefined, apiBase, timeoutMs);
   if (res.status === 404) return null;
   if (res.status !== 200) throw new Error('mempool tx lookup failed (HTTP ' + res.status + ')');
   return JSON.parse(res.body);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction fee — sum(input prevout values) − total outputs (0.7.18).
+// The input values are NOT in the transaction hex: they live in the
+// parent transactions, fetched from the node (GET /api/tx/:txid).
+// Best-effort only: any lookup failure, unknown parent, or
+// inconsistent value returns null — the caller stores null and the
+// add / dry-run still succeeds. The fee is stored on the record at
+// add time (and refreshed by a dry-run, and recomputed at startup)
+// so the card can show it.
+// ---------------------------------------------------------------------------
+
+// A mempool /api/tx vout value, as exact satoshis. The API returns
+// the value in SATOSHIS (an integer — the genesis coinbase pays
+// 5000000000, i.e. 50 BTC), NOT in BTC: treating it as BTC and
+// multiplying by 1e8 inflated every parent value a hundred-million
+// fold (a 14,913-sat parent read as 1,491,300,000,000 sats, so a
+// ~224-sat fee displayed as ~1.49 trillion). Returns a BigInt, or
+// null when the value is not a finite non-negative integer.
+function satsValue(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || !Number.isInteger(value)) return null;
+  return BigInt(value);
+}
+
+// One input's prevout value, in satoshis, from the node that knows
+// its parent transaction. The endpoints are tried in order; an
+// endpoint that does not know the parent (404) falls through to
+// the next, and an endpoint that is down does too. A parent the
+// node knows but whose vout is missing (or unparseable) is a real
+// answer, not a reason to retry — it returns null.
+async function parentOutputValue(prevTxid, prevVout, endpoints, timeoutMs) {
+  for (const ep of endpoints) {
+    let st;
+    try {
+      st = await mempoolTxStatus(prevTxid, ep.base, timeoutMs);
+    } catch {
+      continue; // endpoint down — try the next
+    }
+    if (st === null) continue; // unknown here — maybe the other endpoint knows it
+    const vouts = st.vout || [];
+    const out = vouts[prevVout];
+    if (!out) return null;
+    return satsValue(out.value);
+  }
+  return null;
+}
+
+// The fee of a parsed transaction: sum(input prevout values) −
+// total outputs, and the fee rate (fee / vsize). Returns
+// { feeSats, feeRateSatVb } or null when any input value cannot be
+// fetched (unknown parent, unreachable node, inconsistent value).
+// The parents are fetched in parallel; each lookup is capped at
+// FEE_LOOKUP_TIMEOUT_MS so a hung node cannot stall an add — the
+// add still succeeds, with no fee stored. Never throws.
+const FEE_LOOKUP_TIMEOUT_MS = 5000;
+async function computeFee(parsed, endpoints) {
+  try {
+    if (!parsed || !Array.isArray(parsed.inputs) || !parsed.inputs.length) return null;
+    const values = await Promise.all(
+      parsed.inputs.map((inp) => parentOutputValue(inp.prevTxid, inp.prevVout, endpoints, FEE_LOOKUP_TIMEOUT_MS))
+    );
+    if (values.some((v) => v === null)) return null;
+    let inSats = 0n;
+    for (const v of values) inSats += v;
+    const fee = inSats - BigInt(parsed.totalOutSats);
+    if (fee < 0n) return null;
+    const vsize = parsed.vsize;
+    if (!vsize || vsize <= 0) return null;
+    return { feeSats: Number(fee), feeRateSatVb: Number(fee) / vsize };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction detail — the inputs and outputs of a parsed transaction,
+// for the card's nested Inputs/Outputs drop-down (0.7.18 refinement):
+// every output with its value and its destination address (or its
+// script type when no address can be derived), every input with its
+// outpoint. Derived at read time in GET /api/state from the stored
+// hex — never stored, so no migration and no restore change (the
+// same pattern as findSharedInputs). An input's value is null here:
+// it needs a parent lookup, and a state read must not touch the
+// network — the UI shows the outpoint alone then. The shape carries
+// the slot (valueSats) for a later stored value.
+// ---------------------------------------------------------------------------
+
+// Base58 (Bitcoin alphabet) and Base58Check: the legacy address
+// encoding. A leading zero byte in the payload is a leading '1'.
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58Encode(buf) {
+  let zeros = 0;
+  while (zeros < buf.length && buf[zeros] === 0) zeros++;
+  let n = 0n;
+  for (const b of buf) n = (n << 8n) | BigInt(b);
+  let s = '';
+  while (n > 0n) {
+    const r = n % 58n;
+    n = n / 58n;
+    s = BASE58_ALPHABET[Number(r)] + s;
+  }
+  return '1'.repeat(zeros) + s;
+}
+function base58checkEncode(version, payload) {
+  const body = Buffer.concat([Buffer.from([version]), payload]);
+  const chk = crypto.createHash('sha256').update(crypto.createHash('sha256').update(body).digest()).digest().subarray(0, 4);
+  return base58Encode(Buffer.concat([body, chk]));
+}
+
+// Bech32 (BIP 173) and Bech32m (BIP 350): the segwit address
+// encoding. Witness version 0 uses bech32 (constant 1); version 1
+// (taproot) uses bech32m (constant 0x2bc830a3). Mainnet only — the
+// app talks to mainnet mempool endpoints.
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+function bech32Polymod(values) {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) {
+      if ((top >> i) & 1) chk ^= GEN[i];
+    }
+  }
+  return chk;
+}
+function bech32HrpExpand(hrp) {
+  const out = [];
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) >> 5);
+  out.push(0);
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) & 31);
+  return out;
+}
+function bech32ConvertBits(data, from, to, pad) {
+  let acc = 0, bits = 0;
+  const out = [];
+  const maxv = (1 << to) - 1;
+  for (const b of data) {
+    acc = (acc << from) | b;
+    bits += from;
+    while (bits >= to) {
+      bits -= to;
+      out.push((acc >> bits) & maxv);
+    }
+  }
+  if (pad) {
+    if (bits > 0) out.push((acc << (to - bits)) & maxv);
+  } else if (bits >= from || ((acc << (to - bits)) & maxv) !== 0) {
+    return null;
+  }
+  return out;
+}
+function bech32Encode(hrp, witver, program) {
+  const spec = witver === 0 ? 1 : 0x2bc830a3;
+  const data = bech32ConvertBits(program, 8, 5, true);
+  if (data === null) return null;
+  const values = bech32HrpExpand(hrp).concat([witver]).concat(data);
+  const polymod = bech32Polymod(values.concat([0, 0, 0, 0, 0, 0])) ^ spec;
+  const checksum = [];
+  for (let i = 0; i < 6; i++) checksum.push((polymod >> (5 * (5 - i))) & 31);
+  return hrp + '1' + [witver].concat(data).concat(checksum).map((v) => BECH32_CHARSET[v]).join('');
+}
+
+// The destination of one output script, as a human address when the
+// script type has one, else its type. No hashing is needed: the
+// hash / witness program is already in the script. Returns
+// { type, address } — address is null for OP_RETURN and for scripts
+// no known type covers.
+function scriptPubKeyInfo(scriptHex) {
+  let script;
+  try { script = Buffer.from(scriptHex || '', 'hex'); } catch { return { type: 'nonstandard', address: null }; }
+  // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+  if (script.length === 25 && script[0] === 0x76 && script[1] === 0xa9 && script[2] === 0x14 && script[23] === 0x88 && script[24] === 0xac) {
+    return { type: 'P2PKH', address: base58checkEncode(0x00, script.subarray(3, 23)) };
+  }
+  // P2SH: OP_HASH160 <20> OP_EQUAL
+  if (script.length === 23 && script[0] === 0xa9 && script[1] === 0x14 && script[22] === 0x87) {
+    return { type: 'P2SH', address: base58checkEncode(0x05, script.subarray(2, 22)) };
+  }
+  // P2WPKH: OP_0 <20>
+  if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
+    return { type: 'P2WPKH', address: bech32Encode('bc', 0, script.subarray(2, 22)) };
+  }
+  // P2WSH: OP_0 <32>
+  if (script.length === 34 && script[0] === 0x00 && script[1] === 0x20) {
+    return { type: 'P2WSH', address: bech32Encode('bc', 0, script.subarray(2, 34)) };
+  }
+  // P2TR: OP_1 <32>
+  if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+    return { type: 'P2TR', address: bech32Encode('bc', 1, script.subarray(2, 34)) };
+  }
+  // OP_RETURN: a data carrier, no destination.
+  if (script.length >= 1 && script[0] === 0x6a) {
+    return { type: 'OP_RETURN', address: null };
+  }
+  return { type: 'nonstandard', address: null };
+}
+
+// The inputs/outputs detail of a parsed transaction. Outputs carry
+// their value (satoshis, as a string — BigInt-safe, like
+// totalOutSats) plus the destination address and script type;
+// inputs carry their outpoint, with valueSats null (no parent
+// lookup at read time — see above). Returns null when the parsed
+// transaction is not usable (defensive only).
+function txIoDetail(parsed) {
+  if (!parsed || !Array.isArray(parsed.inputs) || !Array.isArray(parsed.outputs)) return null;
+  return {
+    inputs: parsed.inputs.map((inp) => ({ prevTxid: inp.prevTxid, prevVout: inp.prevVout, valueSats: null })),
+    outputs: parsed.outputs.map((out) => {
+      const info = scriptPubKeyInfo(out.script);
+      return { valueSats: out.value, address: info.address, type: info.type };
+    }),
+  };
 }
 
 // Tip height from one endpoint (the same probe the connection test uses).
@@ -1141,16 +1370,30 @@ async function getConfirmations(txid, endpoints) {
 }
 
 // ---------------------------------------------------------------------------
+// Archived (settled) transactions — broadcasted, or carrying a release
+// record (broadcast, stale, failed, conflict, submitted-slipstream).
+// Their fate is decided. (The server's RELEASE_STATUSES is the same
+// set; keep the two in sync.)
+// ---------------------------------------------------------------------------
+const ARCHIVED_RELEASE_STATUSES = new Set(['stale', 'failed', 'broadcast', 'conflict', 'submitted-slipstream']);
+function isArchivedTx(tx) {
+  return !!(tx && (tx.broadcasted || (tx.release && ARCHIVED_RELEASE_STATUSES.has(tx.release.status))));
+}
+
+// ---------------------------------------------------------------------------
 // Shared inputs — the same outpoint spent by two stored transactions.
 // Only one of them can ever confirm; the other goes stale the moment the
 // first lands. Parses each stored hex (no network) and groups inputs by
 // prevTxid:prevVout. Returns [{ input, txIds }] for inputs used by 2+
 // transactions. Unparseable hex is skipped (a stored tx is always
-// well-formed, so this is defensive only).
+// well-formed, so this is defensive only). Archived transactions are
+// excluded: their fate is decided, so a live transaction sharing an
+// input with an archived one is not warned about it (round 12).
 // ---------------------------------------------------------------------------
 function findSharedInputs(txs) {
   const byInput = new Map();
   for (const tx of txs || []) {
+    if (isArchivedTx(tx)) continue;
     let parsed;
     try { parsed = parseTx(tx.hex); } catch { continue; }
     for (const inp of parsed.inputs) {
@@ -1201,7 +1444,7 @@ async function testOnePath(apiBase) {
 
 module.exports = {
   parseTx, extractTxFromPsbt, checkInputsUnspent, dryRun, broadcastTx, testConnection,
-  getConfirmations, findSharedInputs, timelockedUntil,
+  getConfirmations, findSharedInputs, isArchivedTx, timelockedUntil, computeFee, txIoDetail, scriptPubKeyInfo,
   broadcastViaSlipstream, getSlipstreamTxStatus,
   normalizePublicApiUrl, mempoolBase, endpointsFor,
   DEFAULT_PUBLIC_API_URL, DEFAULT_SECONDARY_API_URL,

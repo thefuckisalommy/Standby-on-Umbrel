@@ -92,14 +92,10 @@
       <div class="section-head">
         <h2>Pre-signed Bitcoin transactions</h2>
       </div>
-      <p class="muted">Standby stores your presigned Bitcoin transactions, ready when they're needed — a convenient place to keep them, or a dead man's switch: if you stop checking in past the broadcast threshold, it broadcasts the ones you armed below. Sign each one in your own wallet and paste the raw signed hex here.</p>
-      <details class="notice">
-        <summary>These broadcasts are real</summary>
-        <p>The dry-run buttons only check whether the inputs are still unspent — they never broadcast. The release itself broadcasts for real, so keep the inputs unspent (spend them and the transaction goes stale), use RBF so the heir can fee-bump, and remember a false-positive release moves real funds. If this device is down, nothing broadcasts.</p>
-      </details>
-      <p>
+      <p class="btc-actions">
         <button id="btn-btc-test-all">Dry-run all</button>
         <button id="btn-btc-broadcast-all" class="danger">Broadcast all</button>
+        <button id="btn-btc-broadcast-armed" class="danger">Broadcast armed</button>
       </p>
       <p id="btc-all-msg" class="muted"></p>
       <div id="btc-active-list"></div>

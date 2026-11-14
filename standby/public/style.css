@@ -32,7 +32,9 @@ header.appbar {
   position: sticky; top: 0; z-index: 50;
   background: var(--card);
   border-bottom: 1px solid var(--line);
-  padding: 12px 20px;
+  /* Short bar (round 12): the logo text and burger button keep their
+     size — only the blank space above and below them is cut. */
+  padding: 4px 20px;
   display: flex;
   align-items: center;
   gap: 16px;
@@ -119,6 +121,14 @@ button.primary:hover { background: #b45309; }
 button.big { font-size: 18px; padding: 14px 28px; }
 button.danger { border-color: var(--bad); color: var(--bad); }
 button:disabled { opacity: 0.5; cursor: default; }
+/* The three top buttons on the Bitcoin tab (round 12, revised):
+   "Dry-run all", "Broadcast all" and "Broadcast armed" sit on one
+   line at 390px — flex, no wrap, a tight gap and tighter horizontal
+   padding than the default buttons, so they fit without wrapping
+   to a second row. The labels stay readable and the buttons stay
+   tappable (full height, ~100px wide each). */
+.btc-actions { display: flex; gap: 6px; flex-wrap: nowrap; }
+.btc-actions button { flex: 0 1 auto; min-width: 0; padding: 9px 8px; font-size: 14px; white-space: nowrap; }
 .pill {
   display: inline-block; padding: 3px 10px; border-radius: 999px;
   font-size: 13px; font-weight: 600;
@@ -169,8 +179,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 .readiness-item { margin: 12px 0; }
 .readiness-label { color: var(--muted); font-size: 13px; margin-bottom: 2px; }
 .node-lines > div + div { margin-top: 4px; }
-details.notice summary { cursor: pointer; font-weight: 600; }
-details.notice p { margin: 8px 0 0; }
 a { color: #f59e0b; }
 
 /* Card header row: heading left, toggle right. */
@@ -189,23 +197,45 @@ a { color: #f59e0b; }
 .switch input:checked + .slider { background: var(--accent); }
 .switch input:checked + .slider::after { transform: translateX(20px); }
 .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* The arm/disarm toggle on a transaction card is green when armed
+   (the pill next to it says so in words). */
+.switch.green input:checked + .slider { background: var(--ok); }
 /* Scrollable table (recent check-ins): room for ~10 rows, scroll for more. */
 .scroll-table { max-height: 400px; overflow-y: auto; }
 .scroll-table thead th { position: sticky; top: 0; background: var(--card); }
 /* A collapsed message card shows only its header row + toggle. */
 .card.collapsed > :not(.section-head) { display: none; }
 /* The transaction card head: one row, never wrapping — the label
-   takes the space that is left and wraps inside it, the TXID is a
-   fixed width, and the status pill is pinned to the top-right, always
-   in the same spot, no matter how long the label is, and the label
-   can never run over it. (It used to wrap, which could drop the pill
-   below the TXID on a settled card.) The arm/disarm toggle is always
-   its own row below the label. Settled transactions (broadcast or
-   stale) hide their body into a collapsible, collapsed by default. */
+   takes the space that is left and wraps inside it, the status pill
+   is pinned to the top-right, and the arm/disarm toggle sits
+   immediately to the right of the pill, always in the same spot, no
+   matter how long the label is, and the label can never run over
+   them. The pill carries the armed state in words ("Ready + armed" /
+   "Ready + unarmed"); the toggle is the control. Settled and pending
+   cards have no toggle. The card body lives in a collapsible Details,
+   collapsed by default. */
 /* The Archived Transactions card is a <details>, collapsed by default,
    so it takes little space until the owner opens it. The summary reads
-   like the other cards' headings. */
-details.archived summary { cursor: pointer; font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+   like the other cards' headings. The child combinator (>) matters:
+   a descendant selector would also match the NESTED Details summary
+   inside an archived tx card and inflate it to 18px — the nested
+   summaries stay at their own 14px (see .tx-details summary). */
+details.archived > summary { cursor: pointer; font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+/* Every card header on the Transactions tab reads the same size:
+   the Pending and Archived summaries and the Add card's heading
+   match the main "Pre-signed Bitcoin transactions" h2 (18px, bold).
+   Scoped to the Transactions tab — the other tabs keep their own
+   heading sizes. The child combinator (>) again: only the OUTER
+   summary is a header; the nested Details summaries inside the tx
+   cards are not, and keep their 14px. */
+#tab-bitcoin details.pending > summary,
+#tab-bitcoin details.archived > summary,
+#tab-bitcoin #btc-form-title { font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+/* The margin above is the Add-header alignment (0.7.18): .card h3
+   carries a 16px top margin while .card h2 has none, so the Add
+   header text sat 16px lower than the other card headers. Zeroing
+   it here puts the Add header at the same height; font-size and
+   weight are unchanged. */
 
 /* A transaction card nested inside its parent card — the active ones
    live in the Pre-signed Bitcoin transactions card, the settled ones
@@ -214,9 +244,32 @@ details.archived summary { cursor: pointer; font-size: 18px; font-weight: 700; m
 .tx-card.tx-sub { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #14171d; }
 .tx-card .tx-head { display: flex; align-items: flex-start; gap: 12px; flex-wrap: nowrap; }
 .tx-card .tx-head b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; }
-.tx-card .tx-head .txid { flex-shrink: 0; color: var(--muted); font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .tx-card .tx-head .pill { flex-shrink: 0; margin-left: auto; }
-
+/* The toggle is pinned right with the pill — it never shrinks or
+   wraps below the label, however long the label runs. */
+.tx-card .tx-head .switch { flex-shrink: 0; }
+/* The amount, prominent below the header: the BTC figure large,
+   the sats beside it smaller and muted. */
+.tx-amount { font-size: 21px; font-weight: 700; margin-top: 10px; }
+.tx-amount-sats { font-size: 14px; font-weight: 400; color: var(--muted); margin-left: 8px; }
+/* A label/value row inside a card's Details: the label is muted and
+   held to a fixed 120px column so the values line up; the value
+   takes the rest and wraps inside its own column instead of running
+   under the label. The row is flex (0.7.18 round 8): with the old
+   inline layout the TXID's monospace leading space was ~4px wider
+   than the other rows' sans space, so its first glyph sat right of
+   the rest — and an expanded TXID wrapped under the label. One
+   element per row, so its text reads "Label: value". */
+.tx-kv { display: flex; font-size: 14px; margin: 4px 0; overflow-wrap: anywhere; }
+.tx-kv-k { color: var(--muted); flex: 0 0 120px; min-width: 120px; }
+.tx-kv-v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+/* The Fee row uses the same 120px label column as every other
+   Details kv row (0.7.18 round 7): the fee's value starts exactly
+   where the other rows' values start. Round 6 had zeroed the
+   label column here (min-width: 0) to stop the value wrapping,
+   but that put the fee value ~90px left of the other values.
+   The wrapping it fixed was caused by the old buggy fee (trillions
+   of sats); the corrected fee is short and fits in the column. */
 /* A check-in API key row: label left, dates muted, Revoke right. */
 .api-key-row { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
   padding: 10px 0; border-bottom: 1px solid var(--line); }
@@ -229,15 +282,38 @@ p.inline-btns { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center;
 /* The status pop-out (broadcast all) lists one line per transaction. */
 .modal ul.plain-list { margin: 8px 0; padding-left: 18px; }
 .modal ul.plain-list li { margin: 4px 0; overflow-wrap: anywhere; }
-.tx-card .tx-arm { margin-top: 12px; }
-/* The broadcast-route and public-fallback lines sit below the arm
-   toggle, their own rows, as plain text (0.7.17 follow-up: the
-   card selects are gone — both are changed in the Edit popup). */
-.tx-card .tx-route { margin-top: 8px; font-size: 14px; color: var(--muted); }
-.tx-card .tx-fallback { margin-top: 8px; font-size: 14px; color: var(--muted); }
 .tx-card .tx-details { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
 .tx-card .tx-details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
-.tx-card .tx-notes { color: var(--muted); font-size: 14px; margin: 4px 0; }
+/* The Inputs and Outputs drop-downs nested inside a card's
+   Details: two separate <details>, one per side — each summary
+   reads like the Details summary (14px, muted) — the header
+   rules above must not leak into it. Each entry is a kv row
+   (label in the 120px column, content in the value column, no
+   indent — round 8), its content truncated to one line and
+   clickable to open a pop-out with the full info. The summary's
+   disclosure arrow sits on the RIGHT, after the count
+   ("Inputs: 2 >" — round 10): the default left marker is
+   hidden, and a ">" is drawn at the right edge via ::after, so
+   the "Inputs"/"Outputs" text starts flush at the left,
+   aligned with the other Details labels. The arrow rotates
+   90° (points down) while the drop-down is open. */
+.tx-card .tx-io { margin: 4px 0; }
+.tx-card .tx-io summary { display: flex; cursor: pointer; color: var(--muted); font-size: 14px; list-style: none; }
+.tx-card .tx-io summary::-webkit-details-marker { display: none; }
+.tx-card .tx-io summary::after { content: '>'; margin-left: auto; transition: transform 0.15s ease; }
+.tx-card .tx-io[open ] summary::after { transform: rotate(90deg); }
+/* An entry's content is truncated to one line by default — the
+   ellipsis keeps it there even when the short form is still too
+   long — and clickable to open the pop-out. Tapping it never
+   expands the card inline. */
+.tx-card .tx-io-value { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The truncated TXID is clickable — it opens a pop-out with the
+   full value. The pointer cursor (and the title) say so. */
+.tx-card .tx-txid-value { cursor: pointer; }
+/* Notes are a small boxed section inside the Details, only when the
+   transaction has notes. */
+.tx-card .tx-mara { color: var(--muted); font-size: 14px; margin: 4px 0; overflow-wrap: anywhere; }
+.tx-card .tx-notes { color: var(--muted); font-size: 14px; margin: 8px 0 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0f1115; }
 .tx-card .tx-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .tx-card .tx-actions button { padding: 6px 12px; font-size: 14px; }
 /* A sent transaction: green line (when + node + confirmations). A shared

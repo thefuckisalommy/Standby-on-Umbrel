@@ -28,7 +28,7 @@ function defaultState() {
     // and its own release record. The stored tx is raw signed hex ONLY —
     // the server never sees keys.
     // tx = { id, txid, hex, label, notes, createdAt, inputs, outputs,
-    //   totalOutSats, locktime, segwit, enabled, broadcastVia,
+    //   totalOutSats, feeSats, feeRateSatVb, locktime, segwit, enabled, broadcastVia,
     //   release: null | { status: 'broadcast'|'failed'|'stale'|'submitted-slipstream', txid,
     //     method, broadcastedAt | lastAttemptAt, error?, mara? },
     //   broadcasted: null | { txid, broadcastedAt, method,
