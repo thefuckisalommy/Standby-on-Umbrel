@@ -3,7 +3,7 @@
 // Serves the static UI and a JSON API backed by plain files in DATA_DIR.
 // Run:  PORT=3100 DATA_DIR=./data node server.js
 //
-// What this app is (0.7.21): a dead man's switch that does ONE thing —
+// What this app is (0.7.22): a dead man's switch that does ONE thing —
 // broadcast the owner's pre-signed Bitcoin transactions if they stop
 // checking in past the broadcast threshold — or immediately, on the
 // owner's say-so (Broadcast Now on a transaction's own card, or
@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.21';
+const VERSION = '0.7.22';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -296,6 +296,9 @@ function mergeExternalCheckin(state, now) {
   const wasPaused = state.settings.paused;
   state.checkin.lastCheckinAt = ext.raw;
   state.checkin.totalCheckins += 1;
+  // A check-in clears an offline-gap hold (0.7.22): the owner is
+  // alive, the clock resets, and there is nothing to hold back.
+  state.checkin.heldUntil = null;
   for (const t of (state.bitcoin.txs || [])) {
     if (t.release && t.release.status === 'stale') continue;
     t.release = null;
@@ -307,6 +310,46 @@ function mergeExternalCheckin(state, now) {
   }
   store.saveState(DATA_DIR, state);
   store.appendCheckin(DATA_DIR, { ts: ext.raw, method: 'api-key', keyId: ext.keyId, keyLabel: ext.keyLabel, sourceIp: ext.sourceIp || null, autoResumed: wasPaused });
+  return true;
+}
+
+// Offline-gap grace (0.7.22). The release clock cannot tell "the
+// device was off" from "the owner stopped checking in" — both look
+// like a last check-in months ago, and the app would broadcast ~5s
+// after powering back on. The guard is a persisted hold on the
+// broadcast date, granted only when BOTH of these hold:
+//   1. Offline gap: the "I was online" stamp (state.checkin.
+//      lastOnlineAt, written on every hourly release tick) is more
+//      than a quarter of the threshold stale — the device was off
+//      for a meaningful chunk of the window.
+//   2. Clock far along: more than half the threshold has elapsed
+//      since the last check-in — the owner is in the danger zone,
+//      or already past due (past due implies more than half).
+// The hold is heldUntil = now + half the threshold, measured from
+// the moment the app notices — NOT added to the original due date.
+// Adding it to the original due leaves it in the past after a
+// months-long outage, so the release would still fire on boot;
+// measured from now, the owner gets a real grace window after
+// powering back on. Only set when there is no active hold: a
+// reboot during the grace window must not re-extend it (once the
+// app is running again it keeps updating lastOnlineAt, so a fresh
+// gap check would miss it — the persisted heldUntil is what
+// carries it). Returns true when it set a new hold (caller
+// saves); a check-in clears it (see both check-in paths).
+// Uses thresholdDays from settings, never a hardcoded number, so
+// it scales if the owner changes the threshold.
+function applyOfflineHold(state, now) {
+  const s = state.settings;
+  const last = state.checkin.lastCheckinAt ? new Date(state.checkin.lastCheckinAt) : null;
+  const online = state.checkin.lastOnlineAt ? new Date(state.checkin.lastOnlineAt) : null;
+  if (!last || !online) return false;
+  const thresholdMs = s.thresholdDays * 86400000;
+  if (now.getTime() - online.getTime() <= thresholdMs / 4) return false;
+  if (now.getTime() - last.getTime() <= thresholdMs / 2) return false;
+  const heldRaw = state.checkin.heldUntil;
+  const heldMs = (typeof heldRaw === 'string' && heldRaw) ? new Date(heldRaw).getTime() : NaN;
+  if (Number.isFinite(heldMs) && heldMs > now.getTime()) return false;
+  state.checkin.heldUntil = new Date(now.getTime() + thresholdMs / 2).toISOString();
   return true;
 }
 
@@ -322,6 +365,38 @@ function mergeExternalCheckin(state, now) {
 // unknown-reason failure (a node rejection, a network error, a
 // not-yet-final timelocked transaction) is retried on the next
 // hourly tick (0.7.14) — so while any ARMED transaction still
+// The danger zone (0.7.22): the last 25% of the check-in window —
+// the time remaining until the due date is a quarter of the
+// threshold or less (already past due is inside the zone).
+// Actions that would arm a transaction or shorten the window
+// while the clock is here reset the check-in instead of letting
+// a due release fire. thresholdDays is the threshold to measure
+// against (the NEW threshold for a settings save, the current one
+// for arming/adding) — never hardcoded.
+function inDangerZone(state, now, thresholdDays) {
+  if (!state.checkin.lastCheckinAt || !thresholdDays || thresholdDays <= 0) return false;
+  const thresholdMs = thresholdDays * 86400000;
+  const dueMs = new Date(state.checkin.lastCheckinAt).getTime() + thresholdMs;
+  return (dueMs - now.getTime()) <= 0.25 * thresholdMs;
+}
+
+// Reset the check-in clock (0.7.22): the owner is present and
+// doing something in the app that would otherwise let a due
+// release fire soon — shortening the threshold into the danger
+// zone, arming a transaction in the danger zone, or adding one
+// in the danger zone. The clock restarts at now (count +1, hold
+// cleared, "I was online" now) and the reset is recorded in the
+// check-in history under the given method, so the displayed last
+// check-in matches. It only touches the clock — never a release
+// record.
+function resetCheckin(state, now, method) {
+  state.checkin.lastCheckinAt = now.toISOString();
+  state.checkin.totalCheckins += 1;
+  state.checkin.heldUntil = null;
+  state.checkin.lastOnlineAt = now.toISOString();
+  store.appendCheckin(DATA_DIR, { ts: now.toISOString(), method, autoResumed: false });
+}
+
 // carries a 'failed' release record, the status stays 'release-due'
 // and the release keeps running. A stale transaction does not keep
 // it due (stale is terminal: skip it), and a transaction that has
@@ -349,7 +424,23 @@ function checkinStatus(state, now) {
   // time (0.7.5 and earlier only released once the floored day count
   // passed the threshold).
   const dueMs = last.getTime() + s.thresholdDays * 86400000;
-  const nextDue = new Date(dueMs).toISOString();
+  // Offline-gap grace (0.7.22): a hold pushes the effective due
+  // out. heldUntil is a persisted "broadcast no earlier than"
+  // instant; the effective due is the later of the original due and
+  // the hold. When the hold is active it IS the effective due (a
+  // hold is only set when the clock is more than halfway along,
+  // so heldUntil = now + threshold/2 is always past the original
+  // due at set time) — unless the owner changed the threshold
+  // after the hold was set, in which case the later date wins.
+  const heldRaw = state.checkin.heldUntil;
+  const heldMs = (typeof heldRaw === 'string' && heldRaw) ? new Date(heldRaw).getTime() : NaN;
+  const heldActive = Number.isFinite(heldMs) && heldMs > now.getTime();
+  const effectiveDueMs = Number.isFinite(heldMs) ? Math.max(dueMs, heldMs) : dueMs;
+  const nextDue = new Date(effectiveDueMs).toISOString();
+  // Effective window, whole days, for the countdown bar + caption:
+  // last check-in to the effective due. On-track it is the
+  // threshold; while held it is the longer held window.
+  const windowDays = Math.max(1, Math.round((effectiveDueMs - last.getTime()) / 86400000));
   // A 'failed' record on an ARMED transaction means the release is
   // not done: that transaction is still owed a broadcast, and the
   // next hourly tick retries it (0.7.14). Only armed transactions
@@ -368,10 +459,17 @@ function checkinStatus(state, now) {
   // 'failed' record).
   const anyWaitingMara = txs.some((t) => t.enabled && t.release && t.release.status === 'submitted-slipstream');
   if (!anyFailed && !anyWaitingMara && txs.some((t) => t.release && t.release.status === 'broadcast' && t.release.kind === 'release')) {
-    return { state: 'broadcasted', label: 'Broadcasted', daysSince: d, nextDue };
+    return { state: 'broadcasted', label: 'Broadcasted', daysSince: d, nextDue, windowDays };
   }
-  if (now.getTime() < dueMs) return { state: 'on-track', label: 'On track', daysSince: d, nextDue };
-  return { state: 'release-due', label: 'Release due', daysSince: d, nextDue };
+  if (now.getTime() < effectiveDueMs) {
+    // A hold is in force only when it is active AND it is the thing
+    // pushing the due out (heldUntil past the original due). A hold
+    // left over from before a threshold increase does not hold
+    // anything back — the original due is later, so on-track.
+    if (heldActive && heldMs >= dueMs) return { state: 'held', label: 'Grace period', daysSince: d, nextDue, windowDays };
+    return { state: 'on-track', label: 'On track', daysSince: d, nextDue, windowDays };
+  }
+  return { state: 'release-due', label: 'Release due', daysSince: d, nextDue, windowDays };
 }
 
 function days(from, to) {
@@ -748,6 +846,16 @@ async function evaluateRelease() {
       console.error('release withheld: external check-in state is unreadable — not broadcasting until it can be read (see GET /api/status checkinReadError)');
       return { action: 'skipped', reason: 'check-in state unreadable', results: [] };
     }
+    // Offline-gap grace (0.7.22): judged on the stored "I was
+    // online" stamp (the tick refreshes it; a manual release check
+    // does not). Sets + saves a hold when both conditions hold and
+    // none is active, so the evaluation below sees the held clock.
+    // Best-effort — a failure here must not block the evaluation
+    // (the hold is a grace, not a gate).
+    try {
+      const stH = store.loadState(DATA_DIR);
+      if (applyOfflineHold(stH, new Date())) store.saveState(DATA_DIR, stH);
+    } catch (e) { console.error('offline-hold apply failed:', e); }
     return await evaluateReleaseInner();
   } finally {
     releaseEvaluationInFlight = false;
@@ -1137,13 +1245,23 @@ function feePeakForState() {
 }
 
 async function runReleaseTick() {
+  const now = new Date();
+  // Offline-gap grace (0.7.22): the hold is judged on the "I was
+  // online" stamp as it stands BEFORE this tick refreshes it —
+  // refreshing first would shrink the gap to zero and the hold
+  // could never be set. The stamp is then refreshed (so the gap is
+  // measured from this tick onward) and recorded even when the
+  // evaluation below is skipped.
+  try {
+    const st0 = store.loadState(DATA_DIR);
+    mergeExternalCheckin(st0, now);
+    if (applyOfflineHold(st0, now)) store.saveState(DATA_DIR, st0);
+    st0.checkin.lastOnlineAt = now.toISOString();
+    store.saveState(DATA_DIR, st0);
+  } catch (e) { console.error('offline-hold / lastOnlineAt update failed:', e); }
   // A receiver check-in lands in the clock before the release is
   // evaluated, so a check-in that arrived between ticks is honoured
   // even if nobody opened the app.
-  try {
-    const st0 = store.loadState(DATA_DIR);
-    mergeExternalCheckin(st0, new Date());
-  } catch (e) { console.error('external check-in merge failed:', e); }
   try {
     const r = await evaluateRelease();
     if (r.action !== 'skipped') {
@@ -1304,6 +1422,12 @@ async function handleApi(req, res, pathname) {
     // A receiver check-in that landed since the last read is merged
     // first, so the state served is current.
     mergeExternalCheckin(state, now);
+    // Offline-gap grace (0.7.22): the hold is judged here too, so
+    // a page load reflects it even if no release tick has run since
+    // the device came back — the card must show the held date, not
+    // the stale original due. The stamp is NOT refreshed on a read
+    // (only the tick does that), so the gap stays honest.
+    try { if (applyOfflineHold(state, now)) store.saveState(DATA_DIR, state); } catch (e) { console.error('offline-hold apply failed:', e); }
     const served = sanitizeState(state);
     served.bitcoin.overlaps = bitcoin.findSharedInputs(state.bitcoin.txs || []);
     // The fee verdict's 90-day peak (0.7.20): the cached number (or
@@ -1339,6 +1463,9 @@ async function handleApi(req, res, pathname) {
   // GET /api/status
   if (req.method === 'GET' && pathname === '/api/status') {
     const merged = mergeExternalCheckin(state, now);
+    // Offline-gap grace (0.7.22): see GET /api/state — the card
+    // reads this endpoint, so the hold must be judged here too.
+    try { if (applyOfflineHold(state, now)) store.saveState(DATA_DIR, state); } catch (e) { console.error('offline-hold apply failed:', e); }
     const txs = state.bitcoin.txs || [];
     return sendJson(res, 200, {
       ...checkinStatus(state, now),
@@ -1417,6 +1544,9 @@ async function handleApi(req, res, pathname) {
     const wasPaused = state.settings.paused;
     state.checkin.lastCheckinAt = now.toISOString();
     state.checkin.totalCheckins += 1;
+    // A check-in clears an offline-gap hold (0.7.22): the owner is
+    // alive, the clock resets, and there is nothing to hold back.
+    state.checkin.heldUntil = null;
     for (const t of (state.bitcoin.txs || [])) {
       if (t.release && t.release.status === 'stale') continue;
       t.release = null;
@@ -1471,7 +1601,31 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'PUT' && pathname === '/api/settings') {
     const body = await readBody(req);
     const s = state.settings;
-    if (body.thresholdDays !== undefined) s.thresholdDays = clampInt(body.thresholdDays, s.thresholdDays, 1, 3650);
+    let checkinReset = false;
+    if (body.thresholdDays !== undefined) {
+      s.thresholdDays = clampInt(body.thresholdDays, s.thresholdDays, 1, 3650);
+      // (0.7.22) Shortening the threshold can make the clock
+      // instantly overdue — last check-in 20 days ago, threshold
+      // 35 -> due in 15 days; change it to 7 and the new due is
+      // 13 days ago, so the next hourly tick fires. When the new
+      // threshold would make the release immediately due, reset
+      // the check-in instead: the owner is here, changing a
+      // setting, so the clock restarts at now. This is server-side
+      // on purpose — a direct API call cannot bypass it. Only a
+      // shorten whose new due is already past resets; a shorten
+      // that keeps the due in the future, and any lengthen, leave
+      // the clock untouched.
+      // (0.7.22) The danger zone is the last 25% of the window,
+      // measured against the NEW threshold — a shorten that lands
+      // the new due inside 25% of the new threshold (including
+      // already past it) resets; a shorten or lengthen that leaves
+      // the new due comfortably out does not. The old "new due in
+      // the past" rule is subsumed (past due is inside the zone).
+      if (inDangerZone(state, now, s.thresholdDays)) {
+        resetCheckin(state, now, 'threshold-reset');
+        checkinReset = true;
+      }
+    }
     if (body.primaryApiUrl !== undefined) {
       const v = typeof body.primaryApiUrl === 'string' ? body.primaryApiUrl.trim() : '';
       try { s.primaryApiUrl = v ? bitcoin.normalizePublicApiUrl(v) : bitcoin.DEFAULT_PUBLIC_API_URL; }
@@ -1485,7 +1639,9 @@ async function handleApi(req, res, pathname) {
     if (body.vacationMode !== undefined) s.vacationMode = !!body.vacationMode;
     if (body.vacationUntil !== undefined) s.vacationUntil = asStr(body.vacationUntil, 10);
     store.saveState(DATA_DIR, state);
-    return sendJson(res, 200, sanitizeState(state).settings);
+    const out = sanitizeState(state).settings;
+    if (checkinReset) out.checkinReset = true;
+    return sendJson(res, 200, out);
   }
 
   // POST /api/pause — no code required; anyone who can open the app can hold a release.
@@ -1606,8 +1762,20 @@ async function handleApi(req, res, pathname) {
     const fee = await feeFor(parsed);
     if (fee) { tx.feeSats = fee.feeSats; tx.feeRateSatVb = fee.feeRateSatVb; }
     state.bitcoin.txs.push(tx);
+    // (0.7.22) A new tx is armed by default — adding one while
+    // the clock is in the danger zone (the last 25% of the
+    // window, including already past due) would let the release
+    // fire soon after, so the add resets the check-in the same
+    // way arming does (server-side, a direct API call cannot
+    // bypass it). Adding with more than 25% of the window left
+    // does not reset.
+    let checkinReset = false;
+    if (inDangerZone(state, now, state.settings.thresholdDays)) {
+      resetCheckin(state, now, 'add-reset');
+      checkinReset = true;
+    }
     store.saveState(DATA_DIR, state);
-    return sendJson(res, 201, { tx });
+    return sendJson(res, 201, checkinReset ? { tx, checkinReset: true } : { tx });
   }
 
   // POST /api/bitcoin/txs/preview — finalize a file's contents and
@@ -1670,8 +1838,15 @@ async function handleApi(req, res, pathname) {
     const fee = await feeFor(parsed);
     if (fee) { tx.feeSats = fee.feeSats; tx.feeRateSatVb = fee.feeRateSatVb; }
     state.bitcoin.txs.push(tx);
+    // (0.7.22) The import path arms by default too — same reset
+    // as the paste path when the clock is in the danger zone.
+    let checkinReset = false;
+    if (inDangerZone(state, now, state.settings.thresholdDays)) {
+      resetCheckin(state, now, 'add-reset');
+      checkinReset = true;
+    }
     store.saveState(DATA_DIR, state);
-    return sendJson(res, 201, { tx });
+    return sendJson(res, 201, checkinReset ? { tx, checkinReset: true } : { tx });
   }
   if (txsMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
     const tx = (state.bitcoin.txs || []).find((t) => t.id === txsMatch[1]);
@@ -1732,6 +1907,17 @@ async function handleApi(req, res, pathname) {
     }
     if (typeof body.label === 'string') tx.label = asStr(body.label, 80);
     if (typeof body.notes === 'string') tx.notes = asStr(body.notes, 500);
+    // (0.7.22) Arming a transaction while the clock is in the
+    // danger zone (the last 25% of the window, including already
+    // past due) would let the release fire soon after — a
+    // present owner arming a tx should not get a surprise
+    // broadcast. A disarmed→armed transition on a live tx (not
+    // already broadcasted, not stale — one the release could
+    // actually broadcast) resets the check-in instead, server-side
+    // so a direct API call cannot bypass it. Disarming, arming
+    // outside the zone, and arming a broadcasted / stale tx leave
+    // the clock untouched.
+    const wasEnabled = tx.enabled;
     if (typeof body.enabled === 'boolean') tx.enabled = body.enabled;
     // The route toggle on the card (0.7.16): switching the route
     // applies to the NEXT broadcast attempt — a transaction already
@@ -1746,8 +1932,15 @@ async function handleApi(req, res, pathname) {
     // computed from submittedAt at evaluation time (see
     // fallbackDeadline), so no clock is restarted here.
     if (body.publicFallbackDays !== undefined) tx.publicFallbackDays = validPublicFallbackDays(body.publicFallbackDays);
+    let checkinReset = false;
+    if (body.enabled === true && wasEnabled === false
+        && inDangerZone(state, now, state.settings.thresholdDays)
+        && !tx.broadcasted && !(tx.release && tx.release.status === 'stale')) {
+      resetCheckin(state, now, 'arm-reset');
+      checkinReset = true;
+    }
     store.saveState(DATA_DIR, state);
-    return sendJson(res, 200, { tx });
+    return sendJson(res, 200, checkinReset ? { tx, checkinReset: true } : { tx });
   }
 
   // POST /api/bitcoin/txs/:id/broadcast — MANUAL broadcast, now. Same
@@ -2010,6 +2203,34 @@ async function handleApi(req, res, pathname) {
       }
       lastCheckinAt = bsCheckin.lastCheckinAt;
     }
+    // (0.7.22) The "I was online" stamp rides along the same way:
+    // a real date (or null), never in the future beyond the same
+    // 5-minute skew — a future stamp would hide a real offline gap
+    // and defeat the hold. The hold itself (heldUntil) is a date
+    // or null; it is legitimately in the future (that is the point
+    // of a hold), so it is only checked for being a real date —
+    // a backup the app itself wrote always carries a valid one.
+    let lastOnlineAt = null;
+    if (bsCheckin.lastOnlineAt !== undefined && bsCheckin.lastOnlineAt !== null) {
+      if (typeof bsCheckin.lastOnlineAt !== 'string') {
+        return sendError(res, 400, 'backup last-online time is invalid');
+      }
+      const at = new Date(bsCheckin.lastOnlineAt);
+      if (Number.isNaN(at.getTime())) {
+        return sendError(res, 400, 'backup last-online time is not a valid date');
+      }
+      if (at.getTime() > now.getTime() + 5 * 60 * 1000) {
+        return sendError(res, 400, 'backup last-online time is in the future');
+      }
+      lastOnlineAt = bsCheckin.lastOnlineAt;
+    }
+    let heldUntil = null;
+    if (bsCheckin.heldUntil !== undefined && bsCheckin.heldUntil !== null) {
+      if (typeof bsCheckin.heldUntil !== 'string' || Number.isNaN(new Date(bsCheckin.heldUntil).getTime())) {
+        return sendError(res, 400, 'backup hold time is invalid');
+      }
+      heldUntil = bsCheckin.heldUntil;
+    }
     // Check-in API keys ride along in the backup (hashes only — the
     // plaintext keys were never stored, so a backup cannot leak them).
     // A malformed key entry rejects the restore, like a bad tx hex. A
@@ -2041,8 +2262,17 @@ async function handleApi(req, res, pathname) {
           ? bs.bitcoin.connection : { ok: null, checkedAt: null, detail: '' },
       },
       checkin: {
-        lastCheckinAt,
-        totalCheckins: clampInt(bsCheckin.totalCheckins, 0, 0, 1000000),
+        // (0.7.22) A restore is proof the owner is present, so it
+        // counts as a check-in: the clock starts clean at the
+        // restore moment. The backup's clock is still VALIDATED
+        // above (a corrupt or future-dated clock rejects the whole
+        // restore) — it is just not carried forward: lastCheckinAt
+        // and lastOnlineAt are now, heldUntil is cleared, and the
+        // count keeps the backup's total plus this restore.
+        lastCheckinAt: now.toISOString(),
+        totalCheckins: clampInt(bsCheckin.totalCheckins, 0, 0, 1000000) + 1,
+        lastOnlineAt: now.toISOString(),
+        heldUntil: null,
       },
       checkinKeys: restoredKeys,
     };
@@ -2051,6 +2281,12 @@ async function handleApi(req, res, pathname) {
     writeReceiverKeys(restored);
     if (Array.isArray(body.checkins)) store.writeCheckins(DATA_DIR, body.checkins.slice(-200));
     if (Array.isArray(body.broadcastLog)) store.writeBroadcastLog(DATA_DIR, body.broadcastLog.slice(-200));
+    // (0.7.22) The restore itself is a check-in — record it in
+    // the history so the displayed last check-in matches the
+    // refreshed clock. Appended after the backup's own history
+    // (above), so it is the most recent entry; the method reads
+    // 'restore' in the recent-check-ins list.
+    store.appendCheckin(DATA_DIR, { ts: now.toISOString(), method: 'restore', autoResumed: false });
     return sendJson(res, 200, { ok: true, restoredTxs: txs.length, state: sanitizeState(restored) });
   }
 

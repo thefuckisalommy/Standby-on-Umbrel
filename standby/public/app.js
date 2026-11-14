@@ -53,6 +53,25 @@
     return n + (n === 1 ? ' day' : ' days');
   }
 
+  // The danger zone (0.7.22): the last 25% of the check-in window —
+  // the time remaining until the due date is a quarter of the
+  // threshold or less (already past due is inside the zone).
+  // thresholdDays is the threshold to measure against (the entered
+  // value for a settings save, the current one for arming/adding).
+  // Returns null outside the zone (or with no check-in yet), else
+  // { overdue, daysLeft, daysSince } for the confirm wording.
+  function dangerZone(thresholdDays) {
+    var last = S && S.checkin && S.checkin.lastCheckinAt;
+    if (!last || !thresholdDays || thresholdDays <= 0) return null;
+    var remainingMs = new Date(last).getTime() + thresholdDays * 86400000 - Date.now();
+    if (remainingMs > 0.25 * thresholdDays * 86400000) return null;
+    return {
+      overdue: remainingMs <= 0,
+      daysLeft: Math.max(0, Math.ceil(remainingMs / 86400000)),
+      daysSince: Math.floor((Date.now() - new Date(last).getTime()) / 86400000),
+    };
+  }
+
   // Satoshis (a decimal string) -> BTC with up to 8 decimals,
   // trailing zeros trimmed: "100000" -> "0.001", "12500000" ->
   // "0.125". BigInt, so no float ever touches the amount.
@@ -226,6 +245,7 @@
   var PILL_CLASS = {
     'on-track': 'ok', 'release-due': 'bad', 'broadcasted': 'bad',
     'paused': 'warn', 'vacation': 'warn', 'not-started': 'muted',
+    'held': 'warn',
   };
 
   function renderDashboard(status) {
@@ -243,6 +263,7 @@
       : status.state === 'paused' ? 'Releases are paused. Check in to resume automatically.'
       : status.state === 'broadcasted' ? 'A broadcast went out. Check in to start a new cycle.'
       : status.state === 'release-due' ? 'Release is due — the stored transaction will be broadcast unless you check in.'
+      : status.state === 'held' ? 'The broadcast is held until ' + fmtDateShort(status.nextDue) + ' — check in to cancel it.'
       : '';
     line.style.display = line.textContent ? '' : 'none';
     // The countdown + progress bar (0.7.19): how much of the
@@ -254,6 +275,12 @@
     // is a full red bar. With no check-in yet there is no window
     // to measure, so the whole block hides and the status line
     // above the dates explains instead.
+    // (0.7.22) The window is the EFFECTIVE one: the server sends
+    // it as status.windowDays — the threshold on-track, the longer
+    // held window while an offline-gap grace is active. The bar
+    // and the caption measure against it, so a held card counts to
+    // the held date, not the original due. An older server that
+    // sends no windowDays falls back to the threshold.
     var threshold = S.settings.thresholdDays;
     var showCountdown = !!status.lastCheckinAt && typeof threshold === 'number' && threshold > 0;
     [$('checkin-countdown'), $('checkin-countdown-sub'), $('checkin-progress'), $('checkin-progress-label')].forEach(function (el) {
@@ -261,15 +288,16 @@
     });
     if (showCountdown) {
       var daysSince = status.daysSince || 0;
+      var windowDays = (typeof status.windowDays === 'number' && status.windowDays > 0) ? status.windowDays : threshold;
       var overdue = status.state === 'release-due' || (status.nextDue && new Date(status.nextDue) <= Date.now());
       $('checkin-countdown').textContent = overdue
         ? 'Overdue'
         : fmtDays(daysUntil(status.nextDue)) + ' left';
       var fill = $('checkin-progress-fill');
-      fill.style.width = (Math.min(1, Math.max(0, daysSince / threshold)) * 100) + '%';
-      var remaining = (threshold - daysSince) / threshold;
+      fill.style.width = (Math.min(1, Math.max(0, daysSince / windowDays)) * 100) + '%';
+      var remaining = (windowDays - daysSince) / windowDays;
       fill.style.background = remaining > 0.75 ? 'var(--ok)' : remaining > 0.25 ? 'var(--warn)' : 'var(--bad)';
-      $('checkin-progress-label').textContent = daysSince + ' of ' + threshold + ' days elapsed';
+      $('checkin-progress-label').textContent = daysSince + ' of ' + windowDays + ' days elapsed';
     }
     // Last check-in: the absolute date only. The relative elapsed
     // time is already in the progress-bar caption, so no "Checked
@@ -1174,11 +1202,33 @@
   }
 
   async function toggleTx(id, enabled) {
-    try {
-      await api('PUT', '/api/bitcoin/txs/' + encodeURIComponent(id), { enabled: enabled });
-      setMsg($('btc-msg'), enabled ? 'Transaction armed.' : 'Transaction unarmed.', true);
-      await load();
-    } catch (e) { setMsg($('btc-msg'), e.message, false); await load(); }
+    function doToggle() {
+      return (async function () {
+        try {
+          var r = await api('PUT', '/api/bitcoin/txs/' + encodeURIComponent(id), { enabled: enabled });
+          setMsg($('btc-msg'), enabled
+            ? 'Transaction armed.' + (r && r.checkinReset ? ' Your check-in was reset to today.' : '')
+            : 'Transaction unarmed.', true);
+          await load();
+        } catch (e) { setMsg($('btc-msg'), e.message, false); await load(); }
+      })();
+    }
+    // (0.7.22) Arming while the clock is in the danger zone (the
+    // last 25% of the window, including already past due) would
+    // let the release fire soon after — warn first and only arm on
+    // confirm. The server resets the check-in in that case anyway
+    // (a direct API call cannot bypass it); this is the UI telling
+    // the owner what arming will do, before they commit to it.
+    var dz = enabled ? dangerZone(S.settings.thresholdDays) : null;
+    if (dz) {
+      showConfirm('Reset your check-in?',
+        dz.overdue
+          ? 'The release is due — your last check-in was ' + dz.daysSince + ' day' + (dz.daysSince === 1 ? '' : 's') + ' ago. Arming this transaction will broadcast it on the next check. Arming will reset your check-in to today and restart the countdown.'
+          : 'Only ' + dz.daysLeft + ' day' + (dz.daysLeft === 1 ? '' : 's') + ' left until the release is due. Arming will reset your check-in to today and restart the countdown.',
+        doToggle, 'Arm and reset', function () { load(); });
+    } else {
+      doToggle();
+    }
   }
 
   // The ids of the transactions that are NOT active right now
@@ -1441,20 +1491,39 @@
   $('btn-btc-add').addEventListener('click', async function () {
     var hex = $('btc-hex').value.trim();
     if (!hex) { setMsg($('btc-msg'), 'Paste the signed transaction hex first.', false); return; }
-    try {
-      await saveBitcoinSettings();
-      var fbVal = $('btc-fallback').value;
-      var body = { txHex: hex, label: $('btc-label').value, notes: $('btc-notes').value, broadcastVia: $('btc-route').value, publicFallbackDays: fbVal === '' ? null : parseInt(fbVal, 10) };
-      var r = await api('POST', '/api/bitcoin/txs', body);
-      setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to unarm it.', true);
-      $('btc-label').value = '';
-      $('btc-notes').value = '';
-      $('btc-hex').value = '';
-      $('btc-route').value = 'public';
-      $('btc-fallback').value = '';
-      syncAddFallbackRow();
-      await load();
-    } catch (e) { setMsg($('btc-msg'), e.message, false); }
+    function doAdd() {
+      return (async function () {
+        try {
+          await saveBitcoinSettings();
+          var fbVal = $('btc-fallback').value;
+          var body = { txHex: hex, label: $('btc-label').value, notes: $('btc-notes').value, broadcastVia: $('btc-route').value, publicFallbackDays: fbVal === '' ? null : parseInt(fbVal, 10) };
+          var r = await api('POST', '/api/bitcoin/txs', body);
+          setMsg($('btc-msg'), 'Transaction added and armed. TXID ' + r.tx.txid + ' — use the toggle to unarm it.' + (r && r.checkinReset ? ' Your check-in was reset to today.' : ''), true);
+          $('btc-label').value = '';
+          $('btc-notes').value = '';
+          $('btc-hex').value = '';
+          $('btc-route').value = 'public';
+          $('btc-fallback').value = '';
+          syncAddFallbackRow();
+          await load();
+        } catch (e) { setMsg($('btc-msg'), e.message, false); }
+      })();
+    }
+    // (0.7.22) A new tx is armed by default — adding one while the
+    // clock is in the danger zone (the last 25% of the window,
+    // including already past due) would let the release fire soon
+    // after. Warn first; the server resets the check-in in that
+    // case anyway (a direct API call cannot bypass it).
+    var dz = dangerZone(S.settings.thresholdDays);
+    if (dz) {
+      showConfirm('Reset your check-in?',
+        dz.overdue
+          ? 'The release is due — your last check-in was ' + dz.daysSince + ' day' + (dz.daysSince === 1 ? '' : 's') + ' ago. A new transaction is armed by default, so it would broadcast on the next check. Adding it will reset your check-in to today and restart the countdown.'
+          : 'Only ' + dz.daysLeft + ' day' + (dz.daysLeft === 1 ? '' : 's') + ' left until the release is due. Adding it will reset your check-in to today and restart the countdown.',
+        doAdd, 'Add and reset');
+    } else {
+      await doAdd();
+    }
   });
 
   // Import a signed transaction from a file: the file's hex is put
@@ -1534,7 +1603,8 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
   var confirmPending = null;
-  function showConfirm(title, body, onProceed, proceedLabel) {
+  var confirmCancel = null;
+  function showConfirm(title, body, onProceed, proceedLabel, onCancel) {
     $('confirm-title').textContent = title;
     $('confirm-body').textContent = body;
     $('modal-details').innerHTML = '';
@@ -1542,6 +1612,12 @@
     $('confirm-proceed').textContent = proceedLabel || 'Proceed';
     $('confirm-cancel').textContent = 'Cancel';
     confirmPending = onProceed;
+    // (0.7.22 fix) A Cancel/close must not leave a flipped control
+    // stuck on screen: the checkbox has already changed by the time
+    // the confirm opens, and nothing re-rendered it. The caller may
+    // pass an onCancel (usually a re-render) that runs when the
+    // dialog is dismissed any way other than Proceed.
+    confirmCancel = typeof onCancel === 'function' ? onCancel : null;
     $('confirm-modal').classList.add('open');
   }
   function showDetails(title, body, detailsHtml) {
@@ -1551,11 +1627,14 @@
     $('confirm-proceed').style.display = 'none';
     $('confirm-cancel').textContent = 'Close';
     confirmPending = null;
+    confirmCancel = null;
     $('confirm-modal').classList.add('open');
   }
   function hideConfirm() {
     $('confirm-modal').classList.remove('open');
     confirmPending = null;
+    var cb = confirmCancel;
+    confirmCancel = null;
     // A new API key lives only in this page's memory, and only while
     // its pop-out is open: closing the pop-out any way (the X, the
     // Close button, or the backdrop) drops the plaintext and empties
@@ -1564,9 +1643,14 @@
     // rebuilt on every open).
     newKeyPlain = null;
     $('modal-details').innerHTML = '';
+    // The dismiss-any-other-way hook (see showConfirm): it runs
+    // after the modal is closed and the pending action cleared, so
+    // a Cancel re-render cannot resurrect the dialog or re-fire.
+    if (cb) cb();
   }
   $('confirm-proceed').addEventListener('click', function () {
     var fn = confirmPending;
+    confirmCancel = null; // Proceed is not a cancel — the hook must not fire.
     hideConfirm();
     if (fn) fn();
   });
@@ -1865,14 +1949,36 @@
   }
 
   $('btn-save-settings').addEventListener('click', async function () {
-    try {
-      var s = await api('PUT', '/api/settings', {
-        thresholdDays: parseInt($('set-threshold').value, 10),
-      });
-      S.settings = s;
-      setMsg($('settings-msg'), 'Settings saved.', true);
-      await load();
-    } catch (e) { setMsg($('settings-msg'), e.message, false); }
+    var newThreshold = parseInt($('set-threshold').value, 10);
+    // (0.7.22) Saving a threshold that puts the clock in the
+    // danger zone (the last 25% of the new window, including
+    // already past due) resets the check-in — warn first and only
+    // save on confirm. The server resets in that case anyway (a
+    // direct API call cannot bypass it); this confirm is the UI
+    // telling the owner what saving will do, before they commit.
+    var dz = dangerZone(newThreshold);
+    function saveSettings() {
+      return (async function () {
+        try {
+          var s = await api('PUT', '/api/settings', { thresholdDays: newThreshold });
+          var wasReset = !!s.checkinReset;
+          delete s.checkinReset;
+          S.settings = s;
+          setMsg($('settings-msg'),
+            wasReset ? 'Settings saved. Your check-in was reset to today — the countdown restarts from now.' : 'Settings saved.', true);
+          await load();
+        } catch (e) { setMsg($('settings-msg'), e.message, false); }
+      })();
+    }
+    if (dz) {
+      showConfirm('Reset your check-in?',
+        dz.overdue
+          ? 'This would make the release due immediately — your last check-in was ' + dz.daysSince + ' day' + (dz.daysSince === 1 ? '' : 's') + ' ago. Saving will reset your check-in to today and restart the countdown from now.'
+          : 'This would leave only ' + dz.daysLeft + ' day' + (dz.daysLeft === 1 ? '' : 's') + ' until the release is due. Saving will reset your check-in to today and restart the countdown from now.',
+        saveSettings, 'Save and reset', function () { load(); });
+    } else {
+      saveSettings();
+    }
   });
 
   $('btn-save-vacation').addEventListener('click', async function () {

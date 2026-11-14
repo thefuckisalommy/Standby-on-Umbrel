@@ -39,7 +39,16 @@ function defaultState() {
     // Connection is the last Test-connection result { ok, checkedAt,
     // detail } or { ok: null, ... } if untested.
     bitcoin: { txs: [], connection: { ok: null, checkedAt: null, detail: '' } },
-    checkin: { lastCheckinAt: null, totalCheckins: 0 },
+    // The check-in clock: lastCheckinAt is the last recorded
+    // check-in, totalCheckins counts them. lastOnlineAt (0.7.22)
+    // is the last time the app itself was alive — written on every
+    // hourly release tick, so a long gap in it means the device was
+    // off, not that the owner stopped checking in. heldUntil
+    // (0.7.22) is the offline-gap grace: a persisted "broadcast no
+    // earlier than" instant, set when the app comes back after a
+    // long offline gap with the clock far along, cleared by a
+    // check-in. Both are null until first used.
+    checkin: { lastCheckinAt: null, totalCheckins: 0, lastOnlineAt: null, heldUntil: null },
     // Check-in API keys: one per service that may check in for the
     // owner (a bot, a shortcut, an AI assistant). A key is a bearer
     // token that authorizes exactly one thing — recording a check-in,
