@@ -725,6 +725,135 @@ function mempoolReq(path, method, body, base, timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
+// Fee verdict (0.7.20): is a stored transaction's FIXED fee good
+// enough for a long-term hold? The fee was set when the tx was
+// signed; if the fee market spikes before the release fires, the tx
+// can sit unconfirmed or be evicted. The verdict compares the tx's
+// own fee rate against the "90-day peak" — the 90th percentile of
+// block medians (avgFee_50) over the 3-month window from mempool.
+// ---------------------------------------------------------------------------
+const DEFAULT_FEE_RATES_URL = 'https://mempool.space';
+
+// The fee-rates base URL. The history endpoint is mempool.space-
+// specific — a plain Esplora primary cannot serve it — so the
+// fetch always goes to the mempool.space public endpoint, NOT to
+// the configured node. FEE_RATES_URL lets a test point it at a
+// stub instead (same pattern as SLIPSTREAM_API_URL).
+function feeRatesBase() {
+  const v = (process.env.FEE_RATES_URL || '').trim();
+  if (!v) return DEFAULT_FEE_RATES_URL;
+  let u;
+  try { u = new URL(v); } catch { throw new Error('invalid fee-rates URL: ' + v); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('fee-rates URL must be http(s): ' + v);
+  return u.protocol + '//' + u.host;
+}
+
+// The 90th percentile of a sorted ascending array of numbers
+// (linear interpolation, the standard definition). Returns null
+// when there is nothing to measure.
+function percentile90(sorted) {
+  if (!sorted || !sorted.length) return null;
+  const k = (sorted.length - 1) * 0.9;
+  const f = Math.floor(k), c = Math.ceil(k);
+  if (f === c) return sorted[f];
+  return sorted[f] * (c - k) + sorted[c] * (k - f);
+}
+
+// The "90-day peak" from a fee-rates response: the 90th percentile
+// of the per-block median fee rates (avgFee_50, sat/vB). The peak
+// is a percentile, NOT the literal maximum — one fee spike (a
+// single block at 31,514 sat/vB was seen in the 3m window) would
+// poison a max and make every fee read High Risk.
+function feePeakFromRates(data) {
+  if (!Array.isArray(data)) return null;
+  const medians = [];
+  for (const d of data) {
+    const m = d && d.avgFee_50;
+    if (typeof m === 'number' && Number.isFinite(m) && m >= 0) medians.push(m);
+  }
+  if (!medians.length) return null;
+  medians.sort((a, b) => a - b);
+  return percentile90(medians);
+}
+
+// Fetch the 3-month fee-rates window and return the 90-day peak
+// (sat/vB). Throws on a non-200 answer, an unparseable body, or an
+// empty series — the caller treats that as "no fee data", never
+// as a verdict.
+async function fetchFeePeak() {
+  const base = feeRatesBase();
+  const u = new URL(base);
+  const r = await requestText({
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80),
+    path: '/api/v1/mining/blocks/fee-rates/3m',
+    method: 'GET',
+    headers: {},
+    timeoutMs: NET_TIMEOUT_MS,
+  });
+  if (r.status !== 200) throw new Error('fee-rates answered ' + r.status);
+  let data;
+  try { data = JSON.parse(r.body); } catch { throw new Error('fee-rates body is not JSON'); }
+  const peak = feePeakFromRates(data);
+  if (peak === null) throw new Error('fee-rates returned no usable block medians');
+  return peak;
+}
+
+// Fetch the current recommended fees and return the parsed
+// object {fastestFee, halfHourFee, hourFee, economyFee,
+// minimumFee} (sat/vB, integers). Same base as the fee-rates fetch
+// — the mempool.space public endpoint, NOT the configured node
+// (a plain Esplora has no /api/v1/fees/recommended; it has
+// /api/fee-estimates instead). Throws on a non-200 answer, an
+// unparseable body, or a shape without a usable economy fee —
+// the caller treats that as "no current-fee data" and skips the
+// Critical check, never as a verdict.
+async function fetchCurrentFees() {
+  const base = feeRatesBase();
+  const u = new URL(base);
+  const r = await requestText({
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80),
+    path: '/api/v1/fees/recommended',
+    method: 'GET',
+    headers: {},
+    timeoutMs: NET_TIMEOUT_MS,
+  });
+  if (r.status !== 200) throw new Error('fees/recommended answered ' + r.status);
+  let data;
+  try { data = JSON.parse(r.body); } catch { throw new Error('fees/recommended body is not JSON'); }
+  const econ = data && data.economyFee;
+  if (typeof econ !== 'number' || !Number.isFinite(econ) || econ < 0) throw new Error('fees/recommended has no usable economyFee');
+  return {
+    fastestFee: data.fastestFee, halfHourFee: data.halfHourFee,
+    hourFee: data.hourFee, economyFee: econ, minimumFee: data.minimumFee,
+  };
+}
+
+// The verdict itself (Ryan's ladder, Nov 14, extended 0.7.21 with
+// Critical Risk): first the CURRENT check — a fee below the current
+// economy fee would not confirm within a day right now, so it is
+// Critical Risk whatever the history says. Otherwise the
+// historical ladder against the 90-day peak: Low Risk at 2x the
+// peak, Medium Risk at 1x–2x, High Risk below the peak. The
+// economy fee is optional: when it is not supplied (or not a
+// usable number) the Critical check is skipped and only the
+// historical ladder runs. Pure — the frontend mirrors this exact
+// rule (it cannot import this module). Returns null when there is
+// no peak or no fee rate, so the caller shows no verdict instead
+// of a wrong one.
+function feeVerdict(rate, peak, economyFee) {
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) return null;
+  if (typeof peak !== 'number' || !Number.isFinite(peak) || peak <= 0) return null;
+  if (typeof economyFee === 'number' && Number.isFinite(economyFee) && economyFee >= 0 && rate < economyFee) return 'Critical Risk';
+  if (rate >= 2 * peak) return 'Low Risk';
+  if (rate >= peak) return 'Medium Risk';
+  return 'High Risk';
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast paths — primary node first, secondary on failure.
 // ---------------------------------------------------------------------------
 
@@ -1507,6 +1636,7 @@ module.exports = {
   parseTx, extractTxFromPsbt, checkInputsUnspent, dryRun, broadcastTx, testConnection,
   getConfirmations, findSharedInputs, isArchivedTx, timelockedUntil, computeFee, txIoDetail, scriptPubKeyInfo,
   broadcastViaSlipstream, getSlipstreamTxStatus,
+  feePeakFromRates, fetchFeePeak, fetchCurrentFees, feeVerdict, DEFAULT_FEE_RATES_URL,
   normalizePublicApiUrl, mempoolBase, endpointsFor,
   DEFAULT_PUBLIC_API_URL, DEFAULT_SECONDARY_API_URL,
   DEFAULT_SLIPSTREAM_API_URL,

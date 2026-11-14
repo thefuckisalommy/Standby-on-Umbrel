@@ -3,7 +3,7 @@
 // Serves the static UI and a JSON API backed by plain files in DATA_DIR.
 // Run:  PORT=3100 DATA_DIR=./data node server.js
 //
-// What this app is (0.7.19): a dead man's switch that does ONE thing —
+// What this app is (0.7.21): a dead man's switch that does ONE thing —
 // broadcast the owner's pre-signed Bitcoin transactions if they stop
 // checking in past the broadcast threshold — or immediately, on the
 // owner's say-so (Broadcast Now on a transaction's own card, or
@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.19';
+const VERSION = '0.7.21';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {
@@ -1067,6 +1067,75 @@ async function refreshPublicFallbacks(state) {
 // transaction, so the stored number stays accurate even when the UI is
 // closed. Best-effort: a node test or a confirmations refresh never
 // breaks the tick.
+// Fee verdict (0.7.20): the "90-day peak" — the 90th percentile of
+// block medians over the 3-month window — is fetched from the
+// mempool.space public fee-rates endpoint (NOT the configured node,
+// which may be a plain Esplora that cannot serve it) and cached in
+// memory. It is refreshed once a day: on the hourly tick when the
+// cached value is older than 24h, and once shortly after startup.
+// A failed refresh keeps the last cached value (a brief outage does
+// not kill the verdict), but a value older than 48h is served as
+// null — a multi-day outage degrades to "no verdict" rather than a
+// stale one. The peak is derived, like the overlaps: it is never
+// stored in state.json, so no migration and no restore change.
+const FEE_PEAK_REFRESH_MS = 24 * 60 * 60 * 1000; // refresh once a day
+const FEE_PEAK_MAX_AGE_MS = 48 * 60 * 60 * 1000; // older than this: no verdict
+let feePeakCache = { peak: null, fetchedAt: null };
+
+async function refreshFeePeakIfStale() {
+  if (feePeakCache.fetchedAt && (Date.now() - feePeakCache.fetchedAt) < FEE_PEAK_REFRESH_MS) return;
+  try {
+    const peak = await bitcoin.fetchFeePeak();
+    feePeakCache = { peak, fetchedAt: Date.now() };
+  } catch (e) {
+    console.error('fee-peak refresh failed (keeping last cached value):', e.message);
+  }
+}
+
+// The current recommended fees (0.7.21): the same mempool.space
+// public base, the /api/v1/fees/recommended endpoint — NOT the
+// configured node (a plain Esplora has no such endpoint). Cached
+// in memory and refreshed once an hour: on the hourly tick when
+// the cached value is older than 1h, and once shortly after
+// startup. The current fee moves fast, so a value older than 2h
+// is served as null — the Critical check is then skipped and the
+// verdict falls back to the historical ladder, rather than
+// judging a live fee against a stale one. Like the peak, the
+// current fees are derived, never stored in state.json.
+const FEE_CURRENT_REFRESH_MS = 60 * 60 * 1000; // refresh once an hour
+const FEE_CURRENT_MAX_AGE_MS = 2 * 60 * 60 * 1000; // older than this: no Critical check
+let currentFeesCache = { fees: null, fetchedAt: null };
+
+async function refreshCurrentFeesIfStale() {
+  if (currentFeesCache.fetchedAt && (Date.now() - currentFeesCache.fetchedAt) < FEE_CURRENT_REFRESH_MS) return;
+  try {
+    const fees = await bitcoin.fetchCurrentFees();
+    currentFeesCache = { fees, fetchedAt: Date.now() };
+  } catch (e) {
+    console.error('current-fees refresh failed (keeping last cached value):', e.message);
+  }
+}
+
+// The current recommended fees to serve with the state: the cached
+// object, or null when there is nothing cached or the cached value
+// is too old to present as current. The fetched-at timestamp rides
+// along so the value is clearly labelled, never silently stale.
+function currentFeesForState() {
+  if (!currentFeesCache.fees || !currentFeesCache.fetchedAt) return { fees: null, fetchedAt: null };
+  if ((Date.now() - currentFeesCache.fetchedAt) > FEE_CURRENT_MAX_AGE_MS) return { fees: null, fetchedAt: null };
+  return { fees: currentFeesCache.fees, fetchedAt: new Date(currentFeesCache.fetchedAt).toISOString() };
+}
+
+// The peak to serve with the state: the cached number, or null when
+// there is nothing cached or the cached value is too old to present
+// as current. The fetched-at timestamp rides along so the value is
+// clearly labelled, never silently stale.
+function feePeakForState() {
+  if (feePeakCache.peak === null || !feePeakCache.fetchedAt) return { peak: null, fetchedAt: null };
+  if ((Date.now() - feePeakCache.fetchedAt) > FEE_PEAK_MAX_AGE_MS) return { peak: null, fetchedAt: null };
+  return { peak: feePeakCache.peak, fetchedAt: new Date(feePeakCache.fetchedAt).toISOString() };
+}
+
 async function runReleaseTick() {
   // A receiver check-in lands in the clock before the release is
   // evaluated, so a check-in that arrived between ticks is honoured
@@ -1107,6 +1176,16 @@ async function runReleaseTick() {
     const st = store.loadState(DATA_DIR);
     await refreshPublicFallbacks(st);
   } catch (e) { console.error('public-fallback refresh failed:', e); }
+  // Fee verdict (0.7.20): refresh the 90-day peak when it is older
+  // than a day, so the per-tx fee verdicts stay current. Best-
+  // effort — a failed refresh never breaks the tick.
+  try { await refreshFeePeakIfStale(); } catch (e) { console.error('fee-peak refresh failed:', e); }
+  // Fee verdict (0.7.21): refresh the current recommended fees when
+  // they are older than an hour, so the Critical Risk check judges
+  // a live fee against a live market. Best-effort — a failed
+  // refresh never breaks the tick (the Critical check is skipped
+  // until the fees come back).
+  try { await refreshCurrentFeesIfStale(); } catch (e) { console.error('current-fees refresh failed:', e); }
 }
 
 // Test both nodes and save the per-endpoint results, so the Dashboard
@@ -1227,6 +1306,24 @@ async function handleApi(req, res, pathname) {
     mergeExternalCheckin(state, now);
     const served = sanitizeState(state);
     served.bitcoin.overlaps = bitcoin.findSharedInputs(state.bitcoin.txs || []);
+    // The fee verdict's 90-day peak (0.7.20): the cached number (or
+    // null when there is no usable fee data), with the fetched-at
+    // timestamp so the value is clearly labelled. Derived on every
+    // read, like the overlaps — never stored, so no migration and no
+    // restore change. The frontend compares each active tx's own fee
+    // rate to this peak; a null peak means no verdict anywhere.
+    const fp = feePeakForState();
+    served.bitcoin.feePeak = fp.peak;
+    served.bitcoin.feePeakAt = fp.fetchedAt;
+    // The current recommended fees (0.7.21): the cached object (or
+    // null when there is no usable current-fee data), with the
+    // fetched-at timestamp. The frontend compares each active tx's
+    // own fee rate to the economy fee for the Critical Risk check;
+    // a null object means the check is skipped and only the
+    // historical ladder runs.
+    const cf = currentFeesForState();
+    served.bitcoin.currentFees = cf.fees;
+    served.bitcoin.currentFeesAt = cf.fetchedAt;
     // The inputs/outputs detail (0.7.18 refinement): derived from
     // the stored hexes on every read, like the overlaps — never
     // stored, so no migration and no restore change. An unparseable
@@ -2188,7 +2285,11 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // Release-evaluation timer: hourly, plus once shortly after startup.
 // The startup fee recompute runs on the same schedule (once, shortly
-// after startup) — see recomputeStoredFees.
+// after startup) — see recomputeStoredFees. The fee peak is fetched
+// once shortly after startup too (the hourly tick refreshes it daily
+// after that) — see refreshFeePeakIfStale.
 setTimeout(runReleaseTick, 5000);
 setTimeout(recomputeStoredFees, 5000);
+setTimeout(refreshFeePeakIfStale, 2000);
+setTimeout(refreshCurrentFeesIfStale, 2000);
 setInterval(runReleaseTick, 60 * 60 * 1000);

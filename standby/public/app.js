@@ -79,6 +79,68 @@
     return String(r);
   }
 
+  // The fee verdict (0.7.20, extended 0.7.21 with Critical Risk):
+  // is this tx's FIXED fee good enough for a long-term hold?
+  // Ryan's ladder, against the 90-day peak (the 90th percentile
+  // of block medians over 3 months, served as S.bitcoin.feePeak):
+  // Low Risk at 2x the peak, Medium Risk at 1x–2x, High Risk
+  // below the peak. 0.7.21 adds the CURRENT check first: a fee
+  // below the current economy fee (served as
+  // S.bitcoin.currentFees.economyFee) would not confirm within a
+  // day right now, so it is Critical Risk whatever the history
+  // says. When the economy fee is not supplied the Critical check
+  // is skipped and only the historical ladder runs. Mirrors
+  // lib/bitcoin.js feeVerdict exactly (the frontend cannot import
+  // that module). Returns null when there is no peak or no fee
+  // rate, so the caller shows no verdict instead of a wrong one.
+  function feeVerdict(rate, peak, economyFee) {
+    if (typeof rate !== 'number' || !isFinite(rate) || rate < 0) return null;
+    if (typeof peak !== 'number' || !isFinite(peak) || peak <= 0) return null;
+    if (typeof economyFee === 'number' && isFinite(economyFee) && economyFee >= 0 && rate < economyFee) return 'Critical Risk';
+    if (rate >= 2 * peak) return 'Low Risk';
+    if (rate >= peak) return 'Medium Risk';
+    return 'High Risk';
+  }
+
+  // The pill class for a fee verdict: Low green, Medium amber,
+  // High a LIGHTER red (0.7.21), Critical the current red — so
+  // the worst level is visibly the deepest red.
+  function feeVerdictCls(v) {
+    if (v === 'Low Risk') return 'ok';
+    if (v === 'Medium Risk') return 'warn';
+    if (v === 'High Risk') return 'bad-soft';
+    return 'bad';
+  }
+
+  // The fee-risk pop-out (0.7.21): the Fee line is clickable and
+  // opens the shared showDetails pop-out with HOW the verdict was
+  // calculated — the 90-day peak, your fee, the current economy
+  // fee, and the reason for the level — so the verdict is
+  // explainable, not a black box. The numbers use the app's own
+  // one-decimal rate formatting, so they match the Fee line.
+  function showFeePopout(tx, verdict) {
+    var peak = S.bitcoin.feePeak;
+    var econ = S.bitcoin.currentFees && S.bitcoin.currentFees.economyFee;
+    var rate = tx.feeRateSatVb;
+    var body;
+    if (verdict === 'Critical Risk') {
+      body = 'Your fee is ' + fmtRate(rate) + ' sat/vB, but the current economy fee is ' + fmtRate(econ) + ' sat/vB — it would not confirm within a day right now. Because it is below the current market fee, it is ranked Critical Risk.';
+    } else if (verdict === 'Low Risk') {
+      body = 'The 90-day peak is ' + fmtRate(peak) + ' sat/vB. Your fee is ' + fmtRate(rate) + ' sat/vB. Because it is at least 2× the peak (' + fmtRate(2 * peak) + ' sat/vB), it is ranked Low Risk.';
+    } else if (verdict === 'Medium Risk') {
+      body = 'The 90-day peak is ' + fmtRate(peak) + ' sat/vB. Your fee is ' + fmtRate(rate) + ' sat/vB. Low Risk needs ' + fmtRate(2 * peak) + ' sat/vB (2× the peak). Your fee meets the peak but is below 2× the peak, so it is ranked Medium Risk.';
+    } else { // High Risk
+      body = 'The 90-day peak is ' + fmtRate(peak) + ' sat/vB. Your fee is ' + fmtRate(rate) + ' sat/vB. Because it is below the peak (' + fmtRate(peak) + ' sat/vB), it is ranked High Risk.';
+    }
+    var html = '<dl class="kv">'
+      + '<dt>90-day peak</dt><dd>' + escapeHtml(fmtRate(peak) + ' sat/vB') + '</dd>'
+      + '<dt>Your fee</dt><dd>' + escapeHtml(fmtRate(rate) + ' sat/vB') + '</dd>'
+      + ((typeof econ === 'number')
+        ? '<dt>Current economy fee</dt><dd>' + escapeHtml(fmtRate(econ) + ' sat/vB') + '</dd>' : '')
+      + '</dl>';
+    showDetails('Fee risk', body, html);
+  }
+
   // ---------- tabs ----------
   // Each tab is its own subpage: the URL hash names it (#dashboard,
   // #transactions, #settings, #logs), so refreshing the page lands
@@ -223,6 +285,11 @@
     // and archived transactions live in their own cards and will
     // never broadcast at release, so they are not listed here.
     // (No shared-input pill tweak here — that stays on the tx cards.)
+    // (0.7.20) Each row also carries the fee verdict as a second
+    // pill next to the status pill ("Ready + armed" + "Medium Risk"),
+    // colour-coded like the status pill. No verdict when the fee
+    // rate is unknown or the 90-day peak has not been fetched — the
+    // row then shows only the status pill.
     var activeTxs = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
     var txsEl = $('readiness-txs');
     txsEl.innerHTML = '';
@@ -238,6 +305,13 @@
         pill.textContent = txPillText(t, st);
         row.appendChild(label);
         row.appendChild(pill);
+        var fv = feeVerdict(t.feeRateSatVb, S.bitcoin.feePeak, S.bitcoin.currentFees && S.bitcoin.currentFees.economyFee);
+        if (fv) {
+          var fpill = document.createElement('span');
+          fpill.className = 'pill fee-pill ' + feeVerdictCls(fv);
+          fpill.textContent = fv;
+          row.appendChild(fpill);
+        }
         txsEl.appendChild(row);
       });
     } else {
@@ -297,10 +371,13 @@
     }
   }
 
+  // A check-in (0.7.20): no success message below the button — the
+  // refreshed countdown, progress bar and last-check-in date ARE the
+  // confirmation, so the "Checked in just now." line was redundant.
+  // A FAILED check-in still reports its error here.
   $('btn-checkin').addEventListener('click', async function () {
     try {
-      var r = await api('POST', '/api/checkin', { method: 'app' });
-      setMsg($('checkin-msg'), 'Checked in just now.' + (r.autoResumed ? ' Pause cleared automatically.' : ''), true);
+      await api('POST', '/api/checkin', { method: 'app' });
       await load();
       // A check-in also re-tests the nodes, so their status on the
       // Dashboard is fresh when the owner looks at it. Best-effort:
@@ -486,7 +563,8 @@
   // clean check clears it; a dry-run that could not reach the
   // nodes is Node Failure; a failed release is Failed; a dry-run
   // that could not say either way is Unverified; otherwise an armed
-  // tx is Ready and an unarmed one is Disabled. `settled` marks a
+  // tx is Ready and an unarmed one is "unarmed" (0.7.20 — the pill
+  // reads just "unarmed", not "Disabled + unarmed"). `settled` marks a
   // card whose body is collapsed and whose dry-run button is
   // disabled — a broadcasted-and-confirmed, failed, or stale
   // transaction (the Archived card). `pending` marks a card that is
@@ -498,12 +576,16 @@
   // hatch. The route toggle is locked once broadcast: it appears
   // only on Active cards.
   // The status pill carries the armed state as text ("Ready +
-  // armed", "Ready + unarmed") on an Active card — the toggle
-  // next to it is the control, green when armed. A settled or
-  // pending card has no arm state, so it keeps its plain label.
+  // armed") on an Active card — the toggle next to it is the
+  // control, green when armed. An unarmed card's pill reads just
+  // "unarmed" (0.7.20 — "Disabled + unarmed" was silly: the arm
+  // state is the whole status, not a prefix on another one). A
+  // settled or pending card has no arm state, so it keeps its
+  // plain label.
   function txPillText(tx, st) {
     if (st.settled || st.pending) return st.label;
-    return st.label + (tx.enabled ? ' + armed' : ' + unarmed');
+    if (!tx.enabled) return 'unarmed';
+    return st.label + ' + armed';
   }
 
   // One label/value row inside a card's Details: "Label: value".
@@ -636,7 +718,10 @@
         : { label: 'Failed', cls: 'warn', settled: false, pending: false };
     }
     if (dr && dr.unknown) return { label: 'Unverified', cls: 'muted', settled: false, pending: false };
-    if (!tx.enabled) return { label: 'Disabled', cls: 'muted', settled: false, pending: false };
+    // Unarmed (0.7.20): the pill reads just "unarmed" — the label
+    // here is the pill's text, and txPillText returns it plainly
+    // for an unarmed tx instead of appending " + unarmed" to it.
+    if (!tx.enabled) return { label: 'unarmed', cls: 'muted', settled: false, pending: false };
     return { label: 'Ready', cls: 'ok', settled: false, pending: false };
   }
 
@@ -850,8 +935,32 @@
       // value drops the redundant "sats" — the rate's "sat/vB"
       // carries the unit — so even a 50,000-sat fee fits on one
       // line in the 162px left after the column on a phone.
+      // (0.7.20) The fee verdict rides on the same line as a short
+      // colour-coded suffix — " — Low Risk" / " — Medium Risk" /
+      // " — High Risk" — for an ACTIVE tx only (a broadcast or
+      // archived tx's fee is moot, and a pending one is already
+      // submitted). No verdict when the fee rate is unknown or the
+      // 90-day peak has not been fetched: the line stays exactly
+      // as it was, rather than showing a wrong one.
       if (tx.feeSats !== null && tx.feeSats !== undefined) {
-        body.appendChild(kvRow('tx-fee', 'Fee', fmtSats(tx.feeSats) + ' · ' + fmtRate(tx.feeRateSatVb) + ' sat/vB'));
+        var feeRow = kvRow('tx-fee', 'Fee', fmtSats(tx.feeSats) + ' · ' + fmtRate(tx.feeRateSatVb) + ' sat/vB');
+        var fv = (!settled && !pending) ? feeVerdict(tx.feeRateSatVb, S.bitcoin.feePeak, S.bitcoin.currentFees && S.bitcoin.currentFees.economyFee) : null;
+        if (fv) {
+          var fvs = document.createElement('span');
+          fvs.className = 'fee-verdict ' + feeVerdictCls(fv);
+          fvs.textContent = ' — ' + fv;
+          feeRow.children[1].appendChild(fvs);
+          // The Fee line is clickable (0.7.21): tapping it opens
+          // the fee-risk pop-out, which explains how the verdict
+          // was calculated. The pointer cursor and the title say
+          // it is clickable, like the TXID value below. Only
+          // when there is a verdict to explain — a tx with no
+          // verdict has nothing to pop out.
+          feeRow.children[1].className = 'tx-kv-v tx-fee-value';
+          feeRow.children[1].title = 'Click to see how this risk was calculated';
+          feeRow.children[1].addEventListener('click', function () { showFeePopout(tx, fv); });
+        }
+        body.appendChild(feeRow);
       }
       // The TXID, truncated — clickable to open a pop-out with the
       // full 64-hex value (0.7.18 round 8: it used to expand inline,

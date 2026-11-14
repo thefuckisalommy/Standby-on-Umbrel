@@ -13,6 +13,8 @@
   --warn-bg: #451a03;
   --bad: #f87171;
   --bad-bg: #450a0a;
+  --bad-soft: #fca5a5; /* lighter red (0.7.21): High Risk */
+  --bad-soft-bg: #7f1d1d;
   --radius: 10px;
 }
 * { box-sizing: border-box; }
@@ -136,6 +138,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 .pill.ok { background: var(--ok-bg); color: var(--ok); }
 .pill.warn { background: var(--warn-bg); color: var(--warn); }
 .pill.bad { background: var(--bad-bg); color: var(--bad); }
+/* High Risk is a LIGHTER red than Critical Risk (0.7.21): the
+   worst level (Critical) keeps the current red, so the two are
+   visibly distinct. */
+.pill.bad-soft { background: var(--bad-soft-bg); color: var(--bad-soft); }
 .pill.muted { background: #2f3540; color: var(--muted); }
 .stub {
   display: inline-block; padding: 2px 8px; border-radius: 4px;
@@ -196,6 +202,20 @@ button.btn-checkin-big { width: 100%; padding: 16px 20px; font-size: 19px; }
 .tx-row + .tx-row { border-top: 1px solid var(--line); }
 .tx-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; font-weight: 400; }
 .tx-row .pill { flex-shrink: 0; }
+/* The fee verdict suffix on a tx card's Fee line (0.7.20): the
+   " — Low Risk" / " — Medium Risk" / " — High Risk" tail, coloured
+   like the pills (green / amber / red). The readiness list's fee
+   pill reuses .pill itself, so it needs no rule here. */
+.fee-verdict.ok { color: var(--ok); }
+.fee-verdict.warn { color: var(--warn); }
+.fee-verdict.bad { color: var(--bad); }
+/* High Risk is the lighter red (0.7.21); Critical Risk keeps the
+   current red. */
+.fee-verdict.bad-soft { color: var(--bad-soft); }
+/* The Fee line is clickable when it carries a verdict (0.7.21):
+   tapping it opens the fee-risk pop-out. Same pointer cursor as
+   the TXID value. */
+.tx-card .tx-fee-value { cursor: pointer; }
 /* Node Status rows on the Dashboard (0.7.19): host left, status pill
    pinned to the right edge. Scoped to the Dashboard readiness card —
    the Settings "Bitcoin nodes" card (no .node-lines there) keeps its

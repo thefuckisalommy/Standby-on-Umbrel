@@ -5,8 +5,8 @@ manifestVersion: 1
 id: standby
 category: automation
 name: Standby
-version: "0.7.19"
-releaseNotes: "0.7.19: PSBT import now validates the final scripts against the spent-output script type — a P2WPKH input with an empty final_scriptSig and no final_scriptWitness is rejected as not fully signed instead of being accepted and building a transaction the nodes would reject. Unknown script types (taproot) and inputs with no spent-output info are still accepted when at least one final field is non-empty. The Dashboard check-in card now shows a days-left countdown with a progress bar coloured by how much of the check-in window remains, and the release-readiness card lists each active transaction with its status pill, with the node pills right-aligned."
+version: "0.7.21"
+releaseNotes: "0.7.21: the fee verdict is now explainable — tapping a transaction's Fee line opens a pop-out showing how the risk was calculated (the 90-day peak, your fee, the current economy fee, and the reason for the level). A fourth level, Critical Risk, flags a fee below the current economy fee — it would not confirm within a day right now — and it wins over the historical ladder. High Risk is now a lighter red, so Critical Risk's deeper red stands out as the worst level."
 tagline: Presigned Bitcoin transactions, ready when they're needed.
 description: |-
   Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.
