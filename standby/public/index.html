@@ -38,13 +38,17 @@
         <h2>Check-in status</h2>
         <span id="status-pill" class="pill muted">—</span>
       </div>
+      <div id="checkin-countdown" class="countdown">—</div>
+      <p id="checkin-countdown-sub" class="countdown-sub">until your next check-in is due</p>
+      <div id="checkin-progress" class="progress"><div id="checkin-progress-fill"></div></div>
+      <p id="checkin-progress-label" class="progress-label">—</p>
       <p id="status-line" class="muted">Loading…</p>
       <dl class="kv" style="margin-top:12px">
         <dt>Last check-in</dt><dd id="last-checkin">—</dd>
         <dt>Next check-in due</dt><dd id="next-due">—</dd>
       </dl>
       <p style="margin-top:16px">
-        <button id="btn-checkin" class="primary big">✓ Check in — I'm here</button>
+        <button id="btn-checkin" class="primary big btn-checkin-big">✓ Check in — I'm here</button>
       </p>
       <p id="checkin-msg" class="muted"></p>
     </div>
@@ -53,7 +57,7 @@
       <h2>Release readiness</h2>
       <div class="readiness-item">
         <div class="readiness-label">Transaction</div>
-        <div id="readiness-btc">—</div>
+        <div id="readiness-txs" class="tx-list"></div>
       </div>
       <div class="readiness-item">
         <div class="readiness-label">Node Status</div>

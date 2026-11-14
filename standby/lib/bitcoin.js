@@ -287,9 +287,18 @@ function parseTx(hex) {
 // P2PKH, P2WPKH, P2SH-P2WPKH, P2SH multisig, P2WSH single-key and
 // P2WSH M-of-N multisig. An input that already carries
 // final_script_sig (0x07) and/or final_script_witness (0x08) uses
-// those directly, whatever the script type. Anything else (taproot,
-// an exotic witness script, a script type with no usable signature)
-// is reported as not fully signed, not guessed at.
+// those directly — but only after they are validated against the
+// spent-output script type (0.7.19). A P2WPKH input needs a
+// non-empty final_scriptWitness of exactly 2 items (signature +
+// pubkey) and no scriptSig; a P2PKH input needs a non-empty
+// final_scriptSig and no witness; a P2WSH input needs a non-empty
+// witness and no scriptSig. An input whose final fields are present
+// but empty — an empty final_scriptSig with no final_scriptWitness —
+// is NOT finalized: it would build a transaction the nodes reject.
+// Unknown script types (taproot) and inputs with no spent-output
+// info are accepted when at least one final field is non-empty.
+// Anything else (an exotic witness script, a script type with no
+// usable signature) is reported as not fully signed, not guessed at.
 const PSBT_MAGIC = Buffer.from([0x70, 0x73, 0x62, 0x74, 0xff]); // 'psbt\xff'
 const MAX_PSBT_BYTES = 1024 * 1024; // 1 MB — the API body is capped at 1 MB too
 
@@ -412,9 +421,61 @@ function finalizePsbtInput(inputMap, scriptPubKey, index) {
   const finalSig = inputMap.find((e) => e.type === 0x07);
   const finalWit = inputMap.find((e) => e.type === 0x08);
   if (finalSig || finalWit) {
+    // Validate the final fields against the spent-output script
+    // type (0.7.19). Merely carrying a final field is not proof
+    // the input is finalized: a P2WPKH input with an empty
+    // final_scriptSig and no final_scriptWitness would otherwise
+    // be accepted, and the transaction it builds rejected by the
+    // nodes. An "empty" field is one that is absent, or whose
+    // value parses to nothing (an empty scriptSig, or a witness
+    // stack of 0 items).
+    let witItems = null;
+    if (finalWit) {
+      try { witItems = parseWitnessStack(finalWit.value); }
+      catch (e) { throw new Error(at + ' has a malformed final_scriptWitness (' + e.message + ')'); }
+    }
+    const hasSig = !!(finalSig && finalSig.value.length > 0);
+    const hasWit = !!(witItems && witItems.length > 0);
+    const isP2pkh = scriptPubKey && scriptPubKey.length === 25 && scriptPubKey[0] === 0x76 && scriptPubKey[1] === 0xa9
+      && scriptPubKey[2] === 0x14 && scriptPubKey[23] === 0x88 && scriptPubKey[24] === 0xac;
+    const isP2wpkh = scriptPubKey && scriptPubKey.length === 22 && scriptPubKey[0] === 0x00 && scriptPubKey[1] === 0x14;
+    const isP2sh = scriptPubKey && scriptPubKey.length === 23 && scriptPubKey[0] === 0xa9 && scriptPubKey[1] === 0x14 && scriptPubKey[22] === 0x87;
+    const isP2wsh = scriptPubKey && scriptPubKey.length === 34 && scriptPubKey[0] === 0x00 && scriptPubKey[1] === 0x20;
+    if (isP2pkh) {
+      if (!hasSig) throw new Error(at + ' is a P2PKH input with no final_scriptSig, so it is not fully signed');
+      if (hasWit) throw new Error(at + ' is a P2PKH input with a final_scriptWitness, which it should not have');
+    } else if (isP2wpkh) {
+      if (!hasWit) throw new Error(at + ' is a P2WPKH input with no final_scriptWitness, so it is not fully signed');
+      if (witItems.length !== 2) throw new Error(at + ' is a P2WPKH input whose final_scriptWitness does not have exactly 2 items (signature + pubkey)');
+      if (hasSig) throw new Error(at + ' is a P2WPKH input with a final_scriptSig, which it should not have');
+    } else if (isP2sh) {
+      const redeemEntry = inputMap.find((e) => e.type === 0x04);
+      const redeem = redeemEntry ? redeemEntry.value : null;
+      if (redeem && redeem.length === 22 && redeem[0] === 0x00 && redeem[1] === 0x14) {
+        // P2SH-P2WPKH: the redeem script goes in the scriptSig,
+        // the signature + pubkey in the witness.
+        if (!hasSig) throw new Error(at + ' is a P2SH-P2WPKH input with no final_scriptSig, so it is not fully signed');
+        if (!hasWit) throw new Error(at + ' is a P2SH-P2WPKH input with no final_scriptWitness, so it is not fully signed');
+      } else if (redeem && parseMultisigScript(redeem)) {
+        if (!hasSig) throw new Error(at + ' is a P2SH multisig input with no final_scriptSig, so it is not fully signed');
+        if (hasWit) throw new Error(at + ' is a P2SH multisig input with a final_scriptWitness, which it should not have');
+      } else {
+        // Another redeem type, or no redeem_script: do not guess
+        // further — require at least one non-empty final field.
+        if (!hasSig && !hasWit) throw new Error(at + ' has no usable final_scriptSig or final_scriptWitness, so it is not fully signed');
+      }
+    } else if (isP2wsh) {
+      if (!hasWit) throw new Error(at + ' is a P2WSH input with no final_scriptWitness, so it is not fully signed');
+      if (hasSig) throw new Error(at + ' is a P2WSH input with a final_scriptSig, which it should not have');
+    } else {
+      // Unknown script type (including taproot) or no
+      // spent-output info: the finalizer did the work — accept it
+      // as long as at least one final field is actually non-empty.
+      if (!hasSig && !hasWit) throw new Error(at + ' has no usable final_scriptSig or final_scriptWitness, so it is not fully signed');
+    }
     return {
-      scriptSig: finalSig ? finalSig.value : Buffer.alloc(0),
-      witness: finalWit ? parseWitnessStack(finalWit.value) : [],
+      scriptSig: hasSig ? finalSig.value : Buffer.alloc(0),
+      witness: hasWit ? witItems : [],
     };
   }
   const partials = new Map(); // pubkey hex -> signature Buffer

@@ -3,7 +3,7 @@
 // Serves the static UI and a JSON API backed by plain files in DATA_DIR.
 // Run:  PORT=3100 DATA_DIR=./data node server.js
 //
-// What this app is (0.7.17): a dead man's switch that does ONE thing —
+// What this app is (0.7.19): a dead man's switch that does ONE thing —
 // broadcast the owner's pre-signed Bitcoin transactions if they stop
 // checking in past the broadcast threshold — or immediately, on the
 // owner's say-so (Broadcast Now on a transaction's own card, or
@@ -59,7 +59,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // (last.json). Absent on a plain `node server.js` run — the key
 // feature is dormant then; every file access is guarded.
 const CHECKIN_DIR = process.env.CHECKIN_DIR || '/checkin';
-const VERSION = '0.7.18';
+const VERSION = '0.7.19';
 const MAX_BODY = 1024 * 1024; // 1 MB
 
 const MIME = {

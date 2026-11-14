@@ -183,26 +183,68 @@
       : status.state === 'release-due' ? 'Release is due — the stored transaction will be broadcast unless you check in.'
       : '';
     line.style.display = line.textContent ? '' : 'none';
-    // The day counts ride on the date rows instead of their own row:
-    // "11/11/2026, 9:00 AM (0 days)" and "12/16/2026, 9:00 AM
-    // (35 days)". No seconds on either time.
-    $('last-checkin').textContent = status.lastCheckinAt
-      ? fmtDateShort(status.lastCheckinAt) + ' (' + fmtDays(status.daysSince) + ')'
-      : '—';
-    $('next-due').textContent = status.nextDue
-      ? fmtDateShort(status.nextDue) + ' (' + fmtDays(daysUntil(status.nextDue)) + ')'
-      : '—';
-    // The count is the transactions NOT in the Archived or Pending
-    // Transactions cards (broadcasted, stale, or still waiting for
-    // a confirmation) — the archived and pending ones will never
-    // broadcast at release, so they are not counted here.
+    // The countdown + progress bar (0.7.19): how much of the
+    // check-in window is used. The window is the configured
+    // threshold (S.settings.thresholdDays) — never a hardcoded
+    // number. The bar fills as days elapse; its colour is by how
+    // much time is LEFT: green while more than 3/4 of the window
+    // remains, amber past that, red in the last quarter. Overdue
+    // is a full red bar. With no check-in yet there is no window
+    // to measure, so the whole block hides and the status line
+    // above the dates explains instead.
+    var threshold = S.settings.thresholdDays;
+    var showCountdown = !!status.lastCheckinAt && typeof threshold === 'number' && threshold > 0;
+    [$('checkin-countdown'), $('checkin-countdown-sub'), $('checkin-progress'), $('checkin-progress-label')].forEach(function (el) {
+      el.style.display = showCountdown ? '' : 'none';
+    });
+    if (showCountdown) {
+      var daysSince = status.daysSince || 0;
+      var overdue = status.state === 'release-due' || (status.nextDue && new Date(status.nextDue) <= Date.now());
+      $('checkin-countdown').textContent = overdue
+        ? 'Overdue'
+        : fmtDays(daysUntil(status.nextDue)) + ' left';
+      var fill = $('checkin-progress-fill');
+      fill.style.width = (Math.min(1, Math.max(0, daysSince / threshold)) * 100) + '%';
+      var remaining = (threshold - daysSince) / threshold;
+      fill.style.background = remaining > 0.75 ? 'var(--ok)' : remaining > 0.25 ? 'var(--warn)' : 'var(--bad)';
+      $('checkin-progress-label').textContent = daysSince + ' of ' + threshold + ' days elapsed';
+    }
+    // Last check-in: the absolute date only. The relative elapsed
+    // time is already in the progress-bar caption, so no "Checked
+    // in X days ago" line. Next due is the absolute date only —
+    // the countdown above carries the day count now.
+    var lastEl = $('last-checkin');
+    lastEl.textContent = status.lastCheckinAt ? fmtDateShort(status.lastCheckinAt) : '—';
+    $('next-due').textContent = status.nextDue ? fmtDateShort(status.nextDue) : '—';
+    // The transactions, one row each (0.7.19): the label with its
+    // status pill — the same pill the transaction's own card shows
+    // ("Ready + armed", "Timelocked + unarmed", ...), via
+    // txPillText(tx, txStatus(tx)). Only the active ones: pending
+    // and archived transactions live in their own cards and will
+    // never broadcast at release, so they are not listed here.
+    // (No shared-input pill tweak here — that stays on the tx cards.)
     var activeTxs = (S.bitcoin.txs || []).filter(function (t) { return !txStatus(t).settled && !txStatus(t).pending; });
-    var armedActive = activeTxs.filter(function (t) { return t.enabled; }).length;
-    $('readiness-btc').textContent = activeTxs.length
-      ? armedActive + ' of ' + activeTxs.length + ' transaction(s) armed'
-      : (S.bitcoin.txs || []).length
+    var txsEl = $('readiness-txs');
+    txsEl.innerHTML = '';
+    if (activeTxs.length) {
+      activeTxs.forEach(function (t) {
+        var st = txStatus(t);
+        var row = document.createElement('div');
+        row.className = 'tx-row';
+        var label = document.createElement('b');
+        label.textContent = t.label || 'Untitled transaction';
+        var pill = document.createElement('span');
+        pill.className = 'pill ' + st.cls;
+        pill.textContent = txPillText(t, st);
+        row.appendChild(label);
+        row.appendChild(pill);
+        txsEl.appendChild(row);
+      });
+    } else {
+      txsEl.textContent = (S.bitcoin.txs || []).length
         ? 'No active transactions — every stored transaction is pending or archived'
         : 'No transactions stored (no broadcast at release)';
+    }
     // One "Node Status" item, with the Primary and Secondary lines
     // listed below it (each with its own status pill). The status comes
     // from the last connection test — the Test connection button, a

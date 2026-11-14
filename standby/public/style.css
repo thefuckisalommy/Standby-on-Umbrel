@@ -162,6 +162,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 .checklist .done { color: var(--muted); text-decoration: line-through; }
 .progress { height: 8px; background: #2f3540; border-radius: 999px; overflow: hidden; margin: 8px 0; }
 .progress > div { height: 100%; background: var(--accent); }
+/* The check-in countdown + progress bar (0.7.19): how much of the
+   check-in window is used — the big day count, a bar that fills as
+   days elapse (green > 3/4 of the window left, amber past that, red
+   in the last quarter), and the elapsed-days caption. */
+.countdown { font-size: 28px; font-weight: 700; line-height: 1.25; margin: 12px 0 0; }
+.countdown-sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+.progress-label { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+button.btn-checkin-big { width: 100%; padding: 16px 20px; font-size: 19px; }
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-size: 15px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
@@ -179,6 +187,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 .readiness-item { margin: 12px 0; }
 .readiness-label { color: var(--muted); font-size: 13px; margin-bottom: 2px; }
 .node-lines > div + div { margin-top: 4px; }
+/* The per-transaction readiness list (0.7.19): one row per active
+   transaction — label left, readiness-status pill right, thin divider
+   between rows. The label wraps inside its own column; the pill never
+   shrinks or wraps below it. */
+.tx-list { margin-top: 2px; }
+.tx-row { display: flex; align-items: center; gap: 12px; padding: 7px 0; }
+.tx-row + .tx-row { border-top: 1px solid var(--line); }
+.tx-row b { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; font-weight: 400; }
+.tx-row .pill { flex-shrink: 0; }
+/* Node Status rows on the Dashboard (0.7.19): host left, status pill
+   pinned to the right edge. Scoped to the Dashboard readiness card —
+   the Settings "Bitcoin nodes" card (no .node-lines there) keeps its
+   old layout. */
+#tab-dashboard .node-lines > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#tab-dashboard .node-lines > div > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+#tab-dashboard .node-lines .pill { flex-shrink: 0; }
 a { color: #f59e0b; }
 
 /* Card header row: heading left, toggle right. */

@@ -5,8 +5,8 @@ manifestVersion: 1
 id: standby
 category: automation
 name: Standby
-version: "0.7.18"
-releaseNotes: "0.7.18: UI polish on the transaction cards — same-size headers, the arm toggle beside the status pill (Ready + armed / + unarmed), Details collapsed by default with a fee line in sats and sat/vB, and TXID/inputs/outputs opening in pop-outs instead of expanding inline. Separate Dry run all, Broadcast all, and Broadcast armed buttons; the fee is now computed correctly (a units bug had shown it far too large) and stored fees self-correct on restart; the shared-input warning ignores archived transactions."
+version: "0.7.19"
+releaseNotes: "0.7.19: PSBT import now validates the final scripts against the spent-output script type — a P2WPKH input with an empty final_scriptSig and no final_scriptWitness is rejected as not fully signed instead of being accepted and building a transaction the nodes would reject. Unknown script types (taproot) and inputs with no spent-output info are still accepted when at least one final field is non-empty. The Dashboard check-in card now shows a days-left countdown with a progress bar coloured by how much of the check-in window remains, and the release-readiness card lists each active transaction with its status pill, with the node pills right-aligned."
 tagline: Presigned Bitcoin transactions, ready when they're needed.
 description: |-
   Standby helps you prepare Bitcoin transactions in advance and keep them ready for whenever the time comes to use them.
